@@ -6391,7 +6391,7 @@ static const char *get_interp_string(const struct vrend_shader_cfg *cfg, enum tg
       else
          return "";
    case TGSI_INTERPOLATE_PERSPECTIVE:
-      return "smooth ";
+      return "";
    case TGSI_INTERPOLATE_CONSTANT:
       return "flat ";
    case TGSI_INTERPOLATE_COLOR:
