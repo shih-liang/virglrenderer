@@ -124,6 +124,7 @@ struct vrend_query {
    int sub_ctx_id;
    struct vrend_resource *res;
    bool fake_samples_passed;
+   bool invalid;
 };
 
 struct global_error_state {
@@ -11850,10 +11851,15 @@ static bool vrend_check_query(struct vrend_query *query)
    bool ret;
 
    state.result_size = vrend_is_timer_query(query->gltype) ? 8 : 4;
-   ret = vrend_get_one_query_result(query->id, state.result_size == 8,
-         &state.result);
-   if (ret == false)
-      return false;
+
+   if (!query->invalid) {
+      ret = vrend_get_one_query_result(query->id, state.result_size == 8,
+            &state.result);
+      if (ret == false)
+         return false;
+   } else {
+      state.result = 0;
+   }
 
    /* We got a boolean, but the client wanted the actual number of samples
     * blow the number up so that the client doesn't think it was just one pixel
@@ -12052,16 +12058,14 @@ int vrend_create_query(struct vrend_context *ctx, uint32_t handle,
          err = EINVAL;
       break;
    case PIPE_QUERY_TIMESTAMP:
-      if (has_feature(feat_timer_query))
-         q->gltype = GL_TIMESTAMP;
-      else
-         err = EINVAL;
+      q->gltype = GL_TIMESTAMP;
+      if (!has_feature(feat_timer_query))
+         q->invalid = 1;//err = EINVAL;
       break;
    case PIPE_QUERY_TIME_ELAPSED:
-      if (has_feature(feat_timer_query))
-         q->gltype = GL_TIME_ELAPSED;
-      else
-         err = EINVAL;
+      q->gltype = GL_TIME_ELAPSED;
+      if (!has_feature(feat_timer_query))
+         q->invalid = 1;//err = EINVAL;
       break;
    case PIPE_QUERY_PRIMITIVES_GENERATED:
       q->gltype = GL_PRIMITIVES_GENERATED;
@@ -12146,7 +12150,7 @@ int vrend_begin_query(struct vrend_context *ctx, uint32_t handle)
 
    list_delinit(&q->waiting_queries);
 
-   if (q->gltype == GL_TIMESTAMP)
+   if (q->gltype == GL_TIMESTAMP || q->invalid)
       return 0;
 
    if (q->index > 0)
@@ -12165,6 +12169,9 @@ int vrend_end_query(struct vrend_context *ctx, uint32_t handle)
 
    if (q->index > 0 && !has_feature(feat_transform_feedback3))
       return EINVAL;
+
+   if (q->invalid)
+      return 0;
 
    if (vrend_is_timer_query(q->gltype)) {
       if (q->gltype == GL_TIMESTAMP && !has_feature(feat_timer_query)) {
@@ -12241,6 +12248,12 @@ int vrend_get_query_result_qbo(struct vrend_context *ctx, uint32_t handle,
   }
 
   VREND_DEBUG(dbg_query, ctx, "Get query result from Query:%d\n", q->id);
+
+  if (q->invalid) {
+     GLint value = 0;
+     COPY_QUERY_RESULT_TO_BUFFER(q->id, offset, 0, vrend_is_timer_query(q->gltype) ? 8 : 4, 0);
+     return 0;
+  }
 
   GLenum qtype;
 
