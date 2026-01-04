@@ -6301,10 +6301,12 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
 
       if (ctx->prog_type == TGSI_PROCESSOR_VERTEX && ctx->cfg->use_explicit_locations)
          emit_ext(glsl_strbufs, "ARB_explicit_attrib_location", "require");
-      if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT && fs_emit_layout(ctx))
+      /* Core GLSL 150 already includes fragment coord layouts; avoid extension require on hosts that omit the ARB string (e.g., macOS core GL). */
+      if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT && fs_emit_layout(ctx) && ctx->glsl_ver_required < 150)
          emit_ext(glsl_strbufs, "ARB_fragment_coord_conventions", "require");
 
-      if (ctx->ubo_used_mask)
+      /* Uniform buffers are core in GLSL 1.40+; only request the ARB extension when targeting older versions. */
+      if (ctx->ubo_used_mask && ctx->glsl_ver_required < 140)
          emit_ext(glsl_strbufs, "ARB_uniform_buffer_object", "require");
 
       if (ctx->num_cull_dist_prop || ctx->key->num_in_cull || ctx->key->num_out_cull)
@@ -8178,6 +8180,9 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
    bret = tgsi_iterate_shader(tokens, &ctx.iter);
    if (bret == false)
       goto fail;
+
+   if (ctx.shader_req_bits & SHADER_REQ_INTS)
+      ctx.glsl_ver_required = require_glsl_ver(&ctx, 150);
 
    if (ctx.shader_req_bits & SHADER_REQ_FP64)
       ctx.glsl_ver_required = require_glsl_ver(&ctx, 150);

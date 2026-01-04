@@ -716,48 +716,183 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
    assert(glGetError() == GL_NO_ERROR &&
           "Stale error state detected, please check for failures in initialization");
 
+   /* glTexStorage2DMultisample availability check with graceful downgrade:
+    * 
+    * glTexStorage2DMultisample requires:
+    *   - OpenGL 4.3+ or GL_ARB_texture_storage_multisample (desktop GL)
+    *   - OpenGL ES 3.1+ (mobile/ANGLE)
+    * 
+    * Fallback alternatives available on older versions:
+    *   - glTexImage2DMultisample: GL 3.2+ / ES 3.1+ (works on GL 4.1 Core)
+    *   - glRenderbufferStorageMultisample: GL 3.0+ / ES 3.0+ (works on ANGLE)
+    * 
+    * We'll use glTexStorage2DMultisample if available, otherwise fall back to
+    * glTexImage2DMultisample for proper MSAA capability testing. */
+   
+   const char *renderer = (const char *)glGetString(GL_RENDERER);
+   const char *version_str = (const char *)glGetString(GL_VERSION);
+   
+   /* Check multisample function availability with multiple fallback options */
+   bool has_tex_storage_ms = false;
+   bool has_tex_image_ms = false;
+   bool has_rbo_storage_ms = false;
+   
+   if (epoxy_is_desktop_gl()) {
+      /* Desktop OpenGL path */
+      if (epoxy_gl_version() >= 43) {
+         has_tex_storage_ms = true;
+      } else if (epoxy_has_gl_extension("GL_ARB_texture_storage_multisample")) {
+         has_tex_storage_ms = true;
+      }
+      /* glTexImage2DMultisample available since GL 3.2 */
+      if (epoxy_gl_version() >= 32) {
+         has_tex_image_ms = true;
+      }
+      /* glRenderbufferStorageMultisample available since GL 3.0 */
+      if (epoxy_gl_version() >= 30) {
+         has_rbo_storage_ms = true;
+      }
+   } else {
+      /* OpenGL ES path */
+      if (epoxy_gl_version() >= 31) {
+         has_tex_storage_ms = true;
+         has_tex_image_ms = true;
+      }
+      /* glRenderbufferStorageMultisample available since ES 3.0 (ANGLE/Metal) */
+      if (epoxy_gl_version() >= 30) {
+         has_rbo_storage_ms = true;
+      }
+   }
+   
+   /* If no multisample functions available at all, disable MSAA */
+   if (!has_tex_storage_ms && !has_tex_image_ms && !has_rbo_storage_ms) {
+      virgl_debug("[VREND FORMATS] No multisample functions available "
+                  "(GL version: %s, renderer: %s, is_desktop: %d). "
+                  "Disabling MSAA support.\n", 
+                  version_str ? version_str : "unknown",
+                  renderer ? renderer : "unknown",
+                  epoxy_is_desktop_gl());
+      memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));
+      return 0;  /* Return 0 to indicate MSAA not supported */
+   }
+   
+   /* Log which multisample method we're using */
+   if (has_tex_storage_ms) {
+      virgl_debug("[VREND FORMATS] Testing MSAA with glTexStorage2DMultisample\n");
+   } else if (has_tex_image_ms) {
+      virgl_debug("[VREND FORMATS] Testing MSAA with glTexImage2DMultisample fallback\n");
+   } else if (has_rbo_storage_ms) {
+      virgl_debug("[VREND FORMATS] Testing MSAA with glRenderbufferStorageMultisample fallback "
+                      "(GL version: %s, renderer: %s)\n",
+                      version_str ? version_str : "unknown",
+                      renderer ? renderer : "unknown");
+   }
+
+   virgl_debug("[VREND FORMATS] Starting MSAA capability test with max_samples=%u\n", max_samples);
+   
    glGenFramebuffers( 1, &fbo );
    memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));
 
    for (int i = 3; i >= 0; i--) {
-      if (test_num_samples[i] > max_samples)
+      if (test_num_samples[i] > max_samples) {
+         virgl_debug("[VREND FORMATS] Skipping %u samples (exceeds max %u)\n", 
+                     test_num_samples[i], max_samples);
          continue;
-      glGenTextures(1, &tex);
-      glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex);
-      glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA32F, 64, 64, GL_TRUE);
+      }
+      
+      virgl_debug("[VREND FORMATS] Testing %u samples...\n", test_num_samples[i]);
+      
+      /* Clear any stale errors before testing */
+      while (glGetError() != GL_NO_ERROR);
+      
+      if (has_tex_storage_ms || has_tex_image_ms) {
+         /* Texture-based MSAA testing - use GL_RGBA8 for better compatibility */
+         glGenTextures(1, &tex);
+         GLenum err1 = glGetError();
+         
+         glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex);
+         GLenum err2 = glGetError();
+         
+         if (has_tex_storage_ms) {
+            glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA8, 64, 64, GL_TRUE);
+         } else {
+            glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA8, 64, 64, GL_TRUE);
+         }
+         GLenum err3 = glGetError();
+         
+         if (err1 != GL_NO_ERROR || err2 != GL_NO_ERROR || err3 != GL_NO_ERROR) {
+            virgl_debug("[VREND FORMATS]   glGenTextures err=0x%x, glBindTexture err=0x%x, glTex*Multisample err=0x%x\n",
+                        err1, err2, err3);
+         }
+      } else {
+         /* Renderbuffer-based MSAA testing (fallback for ES 3.0 / ANGLE) */
+         GLuint rbo;
+         glGenRenderbuffers(1, &rbo);
+         glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+         glRenderbufferStorageMultisample(GL_RENDERBUFFER, test_num_samples[i], GL_RGBA8, 64, 64);
+         tex = rbo;  /* Store RBO handle in tex variable for cleanup */
+      }
+      
       status = glGetError();
       if (status == GL_NO_ERROR) {
          glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, tex, 0);
+         
+         if (has_tex_storage_ms || has_tex_image_ms) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, tex, 0);
+         } else {
+            /* For renderbuffer fallback */
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, tex);
+         }
+         
          status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
          if (status == GL_FRAMEBUFFER_COMPLETE) {
+            virgl_debug("[VREND FORMATS] ✓ %u samples COMPLETE\n", test_num_samples[i]);
             if (max_samples_confirmed < test_num_samples[i])
                max_samples_confirmed = test_num_samples[i];
 
-            for (unsigned k = 0; k < test_num_samples[i]; ++k) {
-               float msp[2];
-               uint32_t compressed;
-               glGetMultisamplefv(GL_SAMPLE_POSITION, k, msp);
-               compressed = ((unsigned)(floor(msp[0] * 16.0f)) & 0xf) << 4;
-               compressed |= ((unsigned)(floor(msp[1] * 16.0f)) & 0xf);
-               caps->sample_locations[out_buf_offsets[i] + (k >> 2)] |= compressed  << (8 * (k & 3));
+            /* glGetMultisamplefv only available in desktop GL (since 3.2), not in GL ES */
+            if (epoxy_is_desktop_gl()) {
+               for (unsigned k = 0; k < test_num_samples[i]; ++k) {
+                  float msp[2];
+                  uint32_t compressed;
+                  glGetMultisamplefv(GL_SAMPLE_POSITION, k, msp);
+                  compressed = ((unsigned)(floor(msp[0] * 16.0f)) & 0xf) << 4;
+                  compressed |= ((unsigned)(floor(msp[1] * 16.0f)) & 0xf);
+                  caps->sample_locations[out_buf_offsets[i] + (k >> 2)] |= compressed  << (8 * (k & 3));
+               }
+            } else {
+               /* OpenGL ES: sample locations not available, leave them zero-initialized */
+               virgl_debug("[VREND FORMATS]   (OpenGL ES: sample locations not available)\n");
             }
             lowest_working_ms_count_idx = i;
          } else {
+            virgl_debug("[VREND FORMATS] ✗ %u samples INCOMPLETE (status=0x%x)\n", 
+                    test_num_samples[i], status);
             /* If a framebuffer doesn't support low sample counts,
              * use the sample position from the last working larger count. */
             if (lowest_working_ms_count_idx > 0) {
                for (unsigned k = 0; k < test_num_samples[i]; ++k) {
                   caps->sample_locations[out_buf_offsets[i] + (k >> 2)] =
-                        caps->sample_locations[out_buf_offsets[lowest_working_ms_count_idx]  + (k >> 2)];
+                     caps->sample_locations[out_buf_offsets[lowest_working_ms_count_idx]  + (k >> 2)];
                }
             }
          }
          glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      } else {
+         virgl_debug("[VREND FORMATS] ✗ %u samples GL_ERROR=0x%x\n", test_num_samples[i], status);
       }
-      glDeleteTextures(1, &tex);
+      
+      /* Cleanup - delete texture or renderbuffer */
+      if (has_tex_storage_ms || has_tex_image_ms) {
+         glDeleteTextures(1, &tex);
+      } else {
+         glDeleteRenderbuffers(1, &tex);
+      }
    }
    glDeleteFramebuffers(1, &fbo);
+   
+   virgl_debug("[VREND FORMATS] MSAA test complete: returning max_samples_confirmed=%u\n", 
+               max_samples_confirmed);
    return max_samples_confirmed;
 }
 
