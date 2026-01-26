@@ -230,6 +230,7 @@ enum features_id
    feat_seamless_cubemap_per_texture,
    feat_vs_layer_viewport,
    feat_vs_viewport_index,
+   feat_draw_elements_base_vertex,
    feat_last,
 };
 
@@ -343,6 +344,7 @@ static const  struct {
    FEAT(seamless_cubemap_per_texture, UNAVAIL, UNAVAIL,  "GL_AMD_seamless_cubemap_per_texture" ),
    FEAT(vs_layer_viewport, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_layer"),
    FEAT(vs_viewport_index, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_viewport_index"),
+   FEAT(draw_elements_base_vertex, 32, 32,  "GL_ARB_draw_elements_base_vertex", "GL_EXT_draw_elements_base_vertex", "GL_OES_draw_elements_base_vertex"),
 };
 
 struct global_renderer_state {
@@ -6203,17 +6205,23 @@ int vrend_draw_vbo(struct vrend_context *ctx,
             glDrawElementsIndirect(mode, elsz, (GLvoid const *)(uintptr_t)info->indirect.offset);
       } else if (info->index_bias) {
          if (info->instance_count > 0) {
-            if (info->start_instance > 0)
+            if (info->start_instance > 0) {
                glDrawElementsInstancedBaseVertexBaseInstance(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset,
                                                              info->instance_count, info->index_bias, info->start_instance);
-            else
+            } else if (has_feature(feat_draw_elements_base_vertex)) {
                glDrawElementsInstancedBaseVertex(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->instance_count, info->index_bias);
-
-
-         } else if (info->min_index != 0 || info->max_index != (unsigned)-1)
-            glDrawRangeElementsBaseVertex(mode, info->min_index, info->max_index, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->index_bias);
-         else
-            glDrawElementsBaseVertex(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->index_bias);
+            } else {
+               return EINVAL;
+            }
+         } else if (has_feature(feat_draw_elements_base_vertex)) {
+            if (info->min_index != 0 || info->max_index != (unsigned)-1) {
+               glDrawRangeElementsBaseVertex(mode, info->min_index, info->max_index, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->index_bias);
+            } else {
+               glDrawElementsBaseVertex(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->index_bias);
+            }
+         } else {
+            return EINVAL;
+         }
       } else if (info->instance_count > 0) {
          if (info->start_instance > 0) {
             glDrawElementsInstancedBaseInstance(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset, info->instance_count, info->start_instance);
