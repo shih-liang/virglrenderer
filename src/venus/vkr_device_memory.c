@@ -404,6 +404,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    if (export_info) {
       if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
          export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
          export_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
       }
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
