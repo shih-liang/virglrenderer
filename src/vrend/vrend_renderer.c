@@ -3832,8 +3832,12 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
             offset *= blsize;
             size *= blsize;
             glTexBufferRange(GL_TEXTURE_BUFFER, internalformat, view->texture->gl_id, offset, size);
-         } else
+         } else if (has_feature(feat_arb_or_gles_ext_texture_buffer)) {
             glTexBuffer(GL_TEXTURE_BUFFER, internalformat, view->texture->gl_id);
+         } else {
+            virgl_warn("glTexBuffer is not implemented\n");
+            return;
+         }
       }
    }
 
