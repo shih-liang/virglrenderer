@@ -6,7 +6,11 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
+<<<<<<< HEAD
 #include "vkr_device_memory.h"
+=======
+ #include "vkr_device_memory.h"
+>>>>>>> 803085d (virglrenderer: expose compositor host mapping)
 #include "vkr_instance.h"
 #include "vkr_physical_device.h"
 

@@ -1533,7 +1533,6 @@ virgl_renderer_import_host_mapping(int ctx_id, int res_handle, void *ptr, uint64
              ? 0
              : -EINVAL;
 }
-
 void
 virgl_renderer_set_iosurface_allowed(int ctx_id, int allowed)
 {

@@ -478,7 +478,6 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
 VIRGL_EXPORT int
 virgl_renderer_import_host_mapping(int ctx_id, int res_handle, void *ptr, uint64_t size,
                                    void *iosurface);
-
 VIRGL_EXPORT void
 virgl_renderer_set_iosurface_allowed(int ctx_id, int allowed);
 
