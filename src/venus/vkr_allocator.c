@@ -33,6 +33,7 @@
 #include "util/macros.h"
 #include "venus-protocol/vulkan.h"
 #include "virgl_resource.h"
+#include "vrend/vrend_metal.h"
 
 #include "vkr_library.h"
 
@@ -163,10 +164,22 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
 
    int fd = -1;
    VkImportMemoryMetalHandleInfoEXT metal_info = { 0 };
+   uint64_t allocation_size = res->vulkan_info.allocation_size;
    VkImportMemoryFdInfoKHR fd_info = { 0 };
+
+   if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP) {
+      const uint64_t heap_size = virgl_metal_heap_size(res->metal_heap);
+      if (heap_size < allocation_size)
+         return NULL;
+      /* The exported heap may contain host-page padding which is outside the
+       * guest Vulkan allocation but inside its aligned transport blob. Map
+       * the complete owned heap so VZ never reaches unrelated host memory. */
+      allocation_size = heap_size;
+   }
+
    VkMemoryAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = res->vulkan_info.allocation_size,
+      .allocationSize = allocation_size,
       .memoryTypeIndex = res->vulkan_info.memory_type_index
    };
 
@@ -206,7 +219,7 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
    mem_info->device = dev_handle;
    mem_info->device_memory = mem_handle;
    mem_info->res_id = res->res_id;
-   mem_info->size = res->vulkan_info.allocation_size;
+   mem_info->size = allocation_size;
 
    list_addtail(&mem_info->head, &vkr_allocator.memories);
 

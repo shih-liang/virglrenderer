@@ -31,6 +31,12 @@
 #include <errno.h>
 #ifdef HAVE_EVENTFD_H
 #include <sys/eventfd.h>
+#else
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #endif
 #include <unistd.h>
 
@@ -88,11 +94,8 @@ bool equal_func(const void *key1, const void *key2)
 
 bool has_eventfd(void)
 {
-#ifdef HAVE_EVENTFD_H
+   /* macOS has no eventfd(2); emulate with a self-connected datagram socket. */
    return true;
-#else
-   return false;
-#endif
 }
 
 int create_eventfd(unsigned int initval)
@@ -100,8 +103,37 @@ int create_eventfd(unsigned int initval)
 #ifdef HAVE_EVENTFD_H
    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
 #else
-   (void)initval;
-   return -1;
+   /* Emulate eventfd with a self-connected unix datagram socket: a single
+    * fd where write() queues onto its own receive buffer. Unlike a pipe
+    * pair, the one fd keeps working after being passed over SCM_RIGHTS,
+    * which is how the proxy hands its fence eventfd to the render server.
+    */
+   static atomic_uint serial;
+   struct sockaddr_un addr;
+   memset(&addr, 0, sizeof(addr));
+   addr.sun_family = AF_UNIX;
+   snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/virgl-evfd-%d-%u",
+            (int)getpid(), atomic_fetch_add(&serial, 1));
+
+   int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+   if (fd < 0)
+      return -1;
+
+   unlink(addr.sun_path);
+   if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+       connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+      unlink(addr.sun_path);
+      close(fd);
+      return -1;
+   }
+   unlink(addr.sun_path);
+
+   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+   fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+   if (initval)
+      write_eventfd(fd, initval);
+   return fd;
 #endif
 }
 

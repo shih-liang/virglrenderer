@@ -603,21 +603,25 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       }
       fd_type = VIRGL_RESOURCE_FD_DMABUF;
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   } else if (can_export_metal) {
+      /* On macOS dma_buf is emulated; prefer a real MTLHeap so DEVICE_LOCAL
+       * image memory is never forced through GetMemoryFdKHR/vkMapMemory.
+       */
+      fd_type = VIRGL_RESOURCE_METAL_HEAP;
+      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
    } else if (can_export_dma_buf) {
       /* prefer dmabuf for easier mapping? */
       fd_type = VIRGL_RESOURCE_FD_DMABUF;
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-   } else if (can_export_opaque || can_export_metal) {
-      /* prefer opaque for performance? */
-      if (can_export_opaque) {
-         fd_type = VIRGL_RESOURCE_FD_OPAQUE;
-         handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-      } else {
-         assert(can_export_metal);
-         fd_type = VIRGL_RESOURCE_METAL_HEAP;
-         handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-      }
+   } else if (can_export_opaque) {
+      fd_type = VIRGL_RESOURCE_FD_OPAQUE;
+      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+   } else {
+      vkr_log("mem is not exportable");
+      return false;
+   }
 
+   if (fd_type == VIRGL_RESOURCE_METAL_HEAP || fd_type == VIRGL_RESOURCE_FD_OPAQUE) {
       STATIC_ASSERT(sizeof(vulkan_info.device_uuid) == VK_UUID_SIZE);
       STATIC_ASSERT(sizeof(vulkan_info.driver_uuid) == VK_UUID_SIZE);
 
@@ -628,13 +632,10 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
       vulkan_info.allocation_size = mem->allocation_size;
       vulkan_info.memory_type_index = mem->memory_type_index;
-   } else {
-      vkr_log("mem is not exportable");
-      return false;
    }
 
-   int fd;
-   MTLResource_id metal_heap;
+   int fd = -1;
+   MTLResource_id metal_heap = NULL;
    if (mem->udmabuf_fd >= 0) {
       fd = os_dupfd_cloexec(mem->udmabuf_fd);
       if (fd < 0) {
@@ -650,7 +651,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
          vkr_log("mem gbm bo export failed (ret %d)", fd);
          return false;
       }
-   } else if (can_export_metal) {
+   } else if (fd_type == VIRGL_RESOURCE_METAL_HEAP) {
       assert(handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
       struct vn_device_proc_table *vk = &mem->device->proc_table;
       const VkMemoryGetMetalHandleInfoEXT metal_info = {

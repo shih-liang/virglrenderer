@@ -9087,7 +9087,7 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       glDeleteMemoryObjectsEXT(1, &res->memobj);
    }
 
-#if defined(ENABLE_GBM) || defined(ENABLE_METAL)
+#if (defined(ENABLE_GBM) || defined(ENABLE_METAL)) && defined(HAVE_EPOXY_EGL_H)
    if (res->egl_image) {
       virgl_egl_image_destroy(egl, res->egl_image);
       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {

@@ -235,6 +235,17 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
          (props.externalMemoryProperties.exportFromImportedHandleTypes &
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
+      /* MoltenVK often omits buffer-level MTLHEAP exportability in
+       * ExternalBufferProperties while still honouring
+       * VkExportMemoryAllocateInfo + GetMemoryMetalHandleEXT for Venus
+       * image memory. Without this, emulated dma_buf stays on the FD path
+       * and DEVICE_LOCAL exports try to map private GPU memory.
+       */
+      if (!physical_dev->is_metal_export_supported) {
+         vkr_log("forcing is_metal_export_supported (props features=0x%x)",
+                 props.externalMemoryProperties.externalMemoryFeatures);
+         physical_dev->is_metal_export_supported = true;
+      }
    }
 
    /* fallback to gbm allocation with dma-buf import */

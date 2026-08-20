@@ -29,6 +29,8 @@ bool virgl_metal_create_texture_from_heap(MTLHeap_id heap,
                                           const struct vrend_metal_texture_description *desc,
                                           MTLTexture_id *tex);
 
+uint64_t virgl_metal_heap_size(MTLHeap_id heap);
+
 void virgl_metal_release_texture(MTLTexture_id tex);
 
 #endif

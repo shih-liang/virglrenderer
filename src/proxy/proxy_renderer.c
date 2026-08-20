@@ -41,11 +41,20 @@ fail:
 void
 proxy_renderer_fini(void)
 {
-   if (proxy_renderer.server)
-      proxy_server_destroy(proxy_renderer.server);
-
-   if (proxy_renderer.client)
+   /* Close the client end first. The in-process server thread sits in
+    * poll/recv on the peer socket; joining it before this close waits
+    * forever and freezes whoever called virgl_renderer_cleanup (often
+    * the AppKit main thread during VM teardown).
+    */
+   if (proxy_renderer.client) {
       proxy_client_destroy(proxy_renderer.client);
+      proxy_renderer.client = NULL;
+   }
+
+   if (proxy_renderer.server) {
+      proxy_server_destroy(proxy_renderer.server);
+      proxy_renderer.server = NULL;
+   }
 
    memset(&proxy_renderer, 0, sizeof(struct proxy_renderer));
 }
