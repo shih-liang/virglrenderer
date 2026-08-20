@@ -10,6 +10,35 @@
 #include "vkr_context.h"
 #include "vkr_physical_device.h"
 
+#ifdef __APPLE__
+#define NATIVEPIPE_DISPLAY_APP_NAME "vmpipe-wayland-gpu-blit"
+#define NATIVEPIPE_DISPLAY_ENGINE_PREFIX "NativePipeDisplay/1/"
+
+static bool
+vkr_nativepipe_display_application(const VkApplicationInfo *app_info)
+{
+   if (!app_info || !app_info->pApplicationName || !app_info->pEngineName)
+      return false;
+   if (strcmp(app_info->pApplicationName, NATIVEPIPE_DISPLAY_APP_NAME))
+      return false;
+
+   const char *prefix = NATIVEPIPE_DISPLAY_ENGINE_PREFIX;
+   const size_t prefix_len = strlen(prefix);
+   if (strncmp(app_info->pEngineName, prefix, prefix_len))
+      return false;
+
+   const char *token = app_info->pEngineName + prefix_len;
+   if (strlen(token) != 32)
+      return false;
+   for (size_t i = 0; i < 32; i++) {
+      const char c = token[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+         return false;
+   }
+   return true;
+}
+#endif
+
 static void
 vkr_dispatch_vkEnumerateInstanceVersion(UNUSED struct vn_dispatch_context *dispatch,
                                         struct vn_command_vkEnumerateInstanceVersion *args)
@@ -201,6 +230,13 @@ vkr_dispatch_vkCreateInstance(struct vn_dispatch_context *dispatch,
          app_info.apiVersion = VK_API_VERSION_1_1;
    }
    create_info->pApplicationInfo = &app_info;
+
+#ifdef __APPLE__
+   if (vkr_nativepipe_display_application(&app_info)) {
+      ctx->iosurface_allowed = true;
+      vkr_log("NativePipe: enabled IOSurface allocation for compositor Venus context");
+   }
+#endif
 
    struct vkr_instance *instance = vkr_context_alloc_object(
       ctx, sizeof(*instance), VK_OBJECT_TYPE_INSTANCE, args->pInstance);
