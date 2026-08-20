@@ -194,7 +194,13 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+#ifdef __APPLE__
+   if (res->iosurface) {
+      CFRelease(res->iosurface);
+      res->iosurface = NULL;
+   }
+#endif
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM && !res->is_host_mapping)
       munmap(res->u.data, res->size);
    else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
       CFRelease(res->u.metal_heap);
@@ -244,6 +250,10 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->res_id = res_id;
    res->fd_type = fd_type;
    res->size = blob_size;
+   res->is_host_mapping = false;
+#ifdef __APPLE__
+   res->iosurface = NULL;
+#endif
 
    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
    assert(fd < 0 || !mmap_ptr);
@@ -361,6 +371,18 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
+#ifdef __APPLE__
+   if (mem->iosurface) {
+      void *ptr = IOSurfaceGetBaseAddress(mem->iosurface);
+      if (!ptr ||
+          !vkr_context_import_host_mapping(ctx, res_id, ptr, blob_size, mem->iosurface))
+         return false;
+
+      *out_blob = blob;
+      return true;
+   }
+#endif
+
    if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
       *out_blob = blob;
       return vkr_context_import_resource_metal(ctx, res_id, blob_size, blob.type, blob.u.metal_heap);
@@ -421,6 +443,45 @@ vkr_context_import_resource(struct vkr_context *ctx,
       return vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
 
    return vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
+}
+
+bool
+vkr_context_import_host_mapping(struct vkr_context *ctx,
+                                uint32_t res_id,
+                                void *ptr,
+                                uint64_t size,
+                                void *iosurface)
+{
+   if (!ctx || !ptr || !size || vkr_context_get_resource(ctx, res_id))
+      return false;
+
+   struct vkr_resource *res = malloc(sizeof(*res));
+   if (!res)
+      return false;
+
+   res->res_id = res_id;
+   res->fd_type = VIRGL_RESOURCE_FD_SHM;
+   res->size = size;
+   res->u.data = ptr;
+   res->is_host_mapping = true;
+#ifdef __APPLE__
+   res->iosurface = iosurface ? (IOSurfaceRef)iosurface : NULL;
+   if (res->iosurface)
+      CFRetain(res->iosurface);
+#else
+   (void)iosurface;
+#endif
+
+   if (!vkr_context_add_resource(ctx, res)) {
+#ifdef __APPLE__
+      if (res->iosurface)
+         CFRelease(res->iosurface);
+#endif
+      free(res);
+      return false;
+   }
+
+   return true;
 }
 
 void

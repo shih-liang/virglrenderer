@@ -115,6 +115,10 @@ struct virgl_resource {
    struct virgl_resource_vulkan_info vulkan_info;
 
    void *private_data;
+
+   /* When fd_type == VIRGL_RESOURCE_FD_SHM && fd < 0 */
+   void *host_ptr;
+   void *host_iosurface;
 };
 
 struct virgl_resource_pipe_callbacks {
@@ -171,6 +175,11 @@ virgl_resource_create_from_metal_heap(struct virgl_context *ctx,
                                       uint32_t res_id,
                                       void *metal_heap,
                                       const struct virgl_resource_vulkan_info *vulkan_info);
+
+struct virgl_resource *
+virgl_resource_create_from_host_ptr(uint32_t res_id,
+                                    void *host_ptr,
+                                    void *host_iosurface);
 
 void
 virgl_resource_remove(uint32_t res_id);

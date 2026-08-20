@@ -234,6 +234,33 @@ virgl_resource_create_from_metal_heap(UNUSED struct virgl_context *ctx,
    return res;
 }
 
+struct virgl_resource *
+virgl_resource_create_from_host_ptr(uint32_t res_id,
+                                    void *host_ptr,
+                                    void *host_iosurface)
+{
+   struct virgl_resource *res;
+
+   if (!host_ptr)
+      return NULL;
+
+   res = virgl_resource_create(res_id);
+   if (!res)
+      return NULL;
+
+   res->fd_type = VIRGL_RESOURCE_FD_SHM;
+   res->fd = -1;
+   res->host_ptr = host_ptr;
+#ifdef __APPLE__
+   if (host_iosurface)
+      res->host_iosurface = (void *)CFRetain(host_iosurface);
+#else
+   (void)host_iosurface;
+#endif
+
+   return res;
+}
+
 void
 virgl_resource_remove(uint32_t res_id)
 {

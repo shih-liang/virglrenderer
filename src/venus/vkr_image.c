@@ -6,7 +6,13 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
+#include "vkr_device_memory.h"
+#include "vkr_instance.h"
 #include "vkr_physical_device.h"
+
+#ifdef __APPLE__
+typedef VkResult (VKAPI_PTR *PFN_vkUseIOSurfaceMVK)(VkImage image, IOSurfaceRef ioSurface);
+#endif
 
 static void
 vkr_image_fix_create_info(struct vkr_device *dev,
@@ -104,6 +110,13 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     */
 
    vkr_image_create_and_add(dispatch->data, args);
+   if (args->ret == VK_SUCCESS && args->pImage && args->pCreateInfo) {
+      struct vkr_image *img = vkr_image_from_handle(*args->pImage);
+      if (img) {
+         img->width = args->pCreateInfo->extent.width;
+         img->height = args->pCreateInfo->extent.height;
+      }
+   }
 }
 
 static void
@@ -166,15 +179,41 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
+   struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
    vn_replace_vkBindImageMemory_args_handle(args);
    args->ret =
       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+
+#ifdef __APPLE__
+   if (args->ret == VK_SUCCESS && ctx->instance) {
+      struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+      IOSurfaceRef iosurface = NULL;
+      if (mem && mem->import_resource_id) {
+         struct vkr_resource *res =
+            vkr_context_get_resource(ctx, mem->import_resource_id);
+         if (res && res->iosurface)
+            iosurface = res->iosurface;
+      } else if (mem && mem->iosurface) {
+         iosurface = mem->iosurface;
+      }
+      if (iosurface) {
+         PFN_vkUseIOSurfaceMVK use_io = (PFN_vkUseIOSurfaceMVK)
+            ctx->vulkan_library.GetInstanceProcAddr(
+               ctx->instance->base.handle.instance, "vkUseIOSurfaceMVK");
+         if (use_io) {
+            VkResult ios_ret = use_io(args->image, iosurface);
+            if (ios_ret != VK_SUCCESS)
+               args->ret = ios_ret;
+         }
+      }
+   }
+#endif
 }
 
 static void

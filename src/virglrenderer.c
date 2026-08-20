@@ -62,6 +62,10 @@
 #include "virgl_resource.h"
 #include "virgl_util.h"
 
+#ifdef ENABLE_VENUS
+#include "vkr_renderer.h"
+#endif
+
 struct global_state {
    bool client_initialized;
    void *cookie;
@@ -1224,6 +1228,11 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       res = virgl_resource_create_from_metal_heap(ctx, args->res_handle, blob.u.metal_heap, &blob.vulkan_info);
       if (!res)
          return -ENOMEM;
+   } else if (blob.type == VIRGL_RESOURCE_FD_SHM && blob.host_ptr) {
+      res = virgl_resource_create_from_host_ptr(args->res_handle, blob.host_ptr,
+                                                blob.host_iosurface);
+      if (!res)
+         return -ENOMEM;
    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
       res = virgl_resource_create_from_fd(args->res_handle,
                                           blob.type,
@@ -1284,8 +1293,13 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
       switch (export_fd_type) {
       case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
-         map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-         map_size = res->map_size;
+         if (res->host_ptr) {
+            map = res->host_ptr;
+            map_size = res->map_size;
+         } else {
+            map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+            map_size = res->map_size;
+         }
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
@@ -1506,6 +1520,33 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
 
    return 0;
 }
+
+#ifdef ENABLE_VENUS
+int
+virgl_renderer_import_host_mapping(int ctx_id, int res_handle, void *ptr, uint64_t size,
+                                   void *iosurface)
+{
+   if (!ptr || !size || !res_handle)
+      return -EINVAL;
+   return vkr_renderer_import_host_mapping((uint32_t)ctx_id, (uint32_t)res_handle, ptr,
+                                           size, iosurface)
+             ? 0
+             : -EINVAL;
+}
+
+void
+virgl_renderer_set_iosurface_allowed(int ctx_id, int allowed)
+{
+   vkr_renderer_set_iosurface_allowed((uint32_t)ctx_id, allowed != 0);
+}
+
+void *
+virgl_renderer_resource_host_iosurface(uint32_t res_handle)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   return res ? res->host_iosurface : NULL;
+}
+#endif
 
 enum virgl_renderer_native_handle_type
 virgl_renderer_create_handle_for_scanout(uint32_t res_id,

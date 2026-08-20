@@ -152,6 +152,8 @@ struct render_context_op_create_resource_reply {
    struct virgl_resource_vulkan_info vulkan_info;
    /* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
    void *res_ptr;
+   /* When fd_type == VIRGL_RESOURCE_FD_SHM host mapping (in_process) */
+   void *res_iosurface;
    /* otherwise followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
 };
 

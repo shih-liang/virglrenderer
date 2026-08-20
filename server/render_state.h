@@ -42,7 +42,8 @@ render_state_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              void **out_res_ptr,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info);
+                             struct virgl_resource_vulkan_info *out_vulkan_info,
+                             void **out_res_iosurface);
 
 bool
 render_state_import_resource(uint32_t ctx_id,

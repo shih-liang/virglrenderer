@@ -112,7 +112,7 @@ render_context_dispatch_create_resource(struct render_context *ctx,
    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
                                           req->blob_size, req->blob_flags, &reply.fd_type,
                                           &res_fd, &reply.res_ptr, &reply.map_info,
-                                          &reply.vulkan_info);
+                                          &reply.vulkan_info, &reply.res_iosurface);
    if (!ok)
       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
 

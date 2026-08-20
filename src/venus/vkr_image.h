@@ -10,6 +10,9 @@
 
 struct vkr_image {
    struct vkr_object base;
+
+   uint32_t width;
+   uint32_t height;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 

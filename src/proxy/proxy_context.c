@@ -376,6 +376,15 @@ proxy_context_get_blob(struct virgl_context *base,
       proxy_context_resource_add(ctx, res_id);
 
       return 0;
+   } else if (!reply_fd_count && reply.res_ptr &&
+              reply.fd_type == VIRGL_RESOURCE_FD_SHM) {
+      blob->type = reply.fd_type;
+      blob->host_ptr = reply.res_ptr;
+      blob->host_iosurface = reply.res_iosurface;
+      blob->map_info = reply.map_info;
+
+      proxy_context_resource_add(ctx, res_id);
+      return 0;
    } else if (!reply_fd_count) {
       proxy_log("invalid reply for blob %" PRIu64, blob_id);
       return -1;
