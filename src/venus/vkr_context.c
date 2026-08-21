@@ -5,6 +5,10 @@
 
 #include "vkr_context.h"
 
+#ifdef __APPLE__
+#include <IOSurface/IOSurface.h>
+#endif
+
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>

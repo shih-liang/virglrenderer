@@ -53,8 +53,12 @@ virgl_resource_destroy_func(void *val)
 
    if (res->pipe_resource)
       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
+   if (res->host_iosurface)
+      CFRelease(res->host_iosurface);
    if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
       CFRelease(res->metal_heap);
+   else if (res->host_ptr)
+      assert(res->fd == -1);
    else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
       close(res->fd);

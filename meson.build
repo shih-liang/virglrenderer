@@ -360,7 +360,8 @@ if with_venus
 
    if host_machine.system() == 'darwin'
       corefoundation = dependency('appleframeworks', modules : ['CoreFoundation'])
-      venus_deps += [corefoundation, metal_dep]
+      iosurface = dependency('appleframeworks', modules : ['IOSurface'])
+      venus_deps += [corefoundation, iosurface, metal_dep]
    endif
 
    conf_data.set('ENABLE_VENUS', 1)

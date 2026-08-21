@@ -6,11 +6,7 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
-<<<<<<< HEAD
 #include "vkr_device_memory.h"
-=======
- #include "vkr_device_memory.h"
->>>>>>> 803085d (virglrenderer: expose compositor host mapping)
 #include "vkr_instance.h"
 #include "vkr_physical_device.h"
 
@@ -188,6 +184,7 @@ vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
 {
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
    vn_replace_vkBindImageMemory_args_handle(args);
@@ -196,7 +193,6 @@ vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
 
 #ifdef __APPLE__
    if (args->ret == VK_SUCCESS && ctx->instance) {
-      struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
       IOSurfaceRef iosurface = NULL;
       if (mem && mem->import_resource_id) {
          struct vkr_resource *res =

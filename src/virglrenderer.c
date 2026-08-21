@@ -1399,7 +1399,9 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
       case VIRGL_RESOURCE_OPAQUE_HANDLE:
-         ret = munmap(res->mapped, res->map_size);
+         /* A HOST3D compositor resource can point directly into an IOSurface.
+          * virglrenderer did not mmap those pages and must not unmap them. */
+         ret = res->host_ptr ? 0 : munmap(res->mapped, res->map_size);
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
