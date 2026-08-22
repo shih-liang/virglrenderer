@@ -935,7 +935,12 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
    bool queried_emulated_fd = false;
    if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
-      VkPhysicalDeviceExternalBufferInfo *info = (VkPhysicalDeviceExternalBufferInfo *)&args->pExternalBufferInfo;
+      /* The decoded command stores a pointer to the temporary Vulkan struct.
+       * Taking the address of that pointer and treating the command fields as
+       * VkPhysicalDeviceExternalBufferInfo corrupts adjacent arguments (most
+       * notably pExternalBufferProperties) during a capability query. */
+      VkPhysicalDeviceExternalBufferInfo *info =
+         (VkPhysicalDeviceExternalBufferInfo *)args->pExternalBufferInfo;
       if (info->handleType & emulated_fd_types) {
          queried_emulated_fd = true;
          info->handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
