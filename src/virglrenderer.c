@@ -1159,7 +1159,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    TRACE_FUNC();
    struct virgl_resource *res;
    struct virgl_context *ctx;
-   struct virgl_context_blob blob;
+   struct virgl_context_blob blob = { 0 };
    bool has_host_storage;
    bool has_guest_storage;
    int ret;
@@ -1228,11 +1228,6 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       res = virgl_resource_create_from_metal_heap(ctx, args->res_handle, blob.u.metal_heap, &blob.vulkan_info);
       if (!res)
          return -ENOMEM;
-   } else if (blob.type == VIRGL_RESOURCE_FD_SHM && blob.host_ptr) {
-      res = virgl_resource_create_from_host_ptr(args->res_handle, blob.host_ptr,
-                                                blob.host_iosurface);
-      if (!res)
-         return -ENOMEM;
    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
       res = virgl_resource_create_from_fd(args->res_handle,
                                           blob.type,
@@ -1293,13 +1288,8 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
       switch (export_fd_type) {
       case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
-         if (res->host_ptr) {
-            map = res->host_ptr;
-            map_size = res->map_size;
-         } else {
-            map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-            map_size = res->map_size;
-         }
+         map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+         map_size = res->map_size;
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
@@ -1399,9 +1389,7 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
       case VIRGL_RESOURCE_OPAQUE_HANDLE:
-         /* A HOST3D compositor resource can point directly into an IOSurface.
-          * virglrenderer did not mmap those pages and must not unmap them. */
-         ret = res->host_ptr ? 0 : munmap(res->mapped, res->map_size);
+         ret = munmap(res->mapped, res->map_size);
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
@@ -1523,32 +1511,6 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
    return 0;
 }
 
-#ifdef ENABLE_VENUS
-int
-virgl_renderer_import_host_mapping(int ctx_id, int res_handle, void *ptr, uint64_t size,
-                                   void *iosurface)
-{
-   if (!ptr || !size || !res_handle)
-      return -EINVAL;
-   return vkr_renderer_import_host_mapping((uint32_t)ctx_id, (uint32_t)res_handle, ptr,
-                                           size, iosurface)
-             ? 0
-             : -EINVAL;
-}
-void
-virgl_renderer_set_iosurface_allowed(int ctx_id, int allowed)
-{
-   vkr_renderer_set_iosurface_allowed((uint32_t)ctx_id, allowed != 0);
-}
-
-void *
-virgl_renderer_resource_host_iosurface(uint32_t res_handle)
-{
-   struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   return res ? res->host_iosurface : NULL;
-}
-#endif
-
 enum virgl_renderer_native_handle_type
 virgl_renderer_create_handle_for_scanout(uint32_t res_id,
                                          uint32_t width,
@@ -1579,7 +1541,7 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
    };
    MTLTexture_id tex;
 
-   if (!virgl_metal_create_texture_from_heap(res->metal_heap,
+   if (!virgl_metal_retain_texture_from_heap(res->metal_heap,
                                              &desc,
                                              &tex))
       return VIRGL_NATIVE_HANDLE_NONE;

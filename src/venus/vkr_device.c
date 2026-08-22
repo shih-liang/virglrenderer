@@ -135,6 +135,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    add_count += physical_dev->EXT_external_memory_dma_buf;
    add_count += physical_dev->KHR_external_fence_fd;
    add_count += physical_dev->EXT_external_memory_metal;
+   add_count += physical_dev->EXT_metal_objects;
    add_count += physical_dev->KHR_portability_subset;
    exts = malloc(sizeof(*exts) * (ext_count + add_count));
    if (!exts) {
@@ -168,11 +169,26 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
       exts[ext_count++] = VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME;
    if (physical_dev->EXT_external_memory_metal)
       exts[ext_count++] = VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME;
+   if (physical_dev->EXT_metal_objects)
+      exts[ext_count++] = VK_EXT_METAL_OBJECTS_EXTENSION_NAME;
    if (physical_dev->KHR_portability_subset)
       exts[ext_count++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
 
    ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
    ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+
+   VkPhysicalDeviceRobustness2FeaturesKHR *robustness2 =
+      vkr_find_struct(args->pCreateInfo->pNext,
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR);
+   const bool null_descriptor_enabled = robustness2 && robustness2->nullDescriptor;
+
+   /* The guest-visible feature is implemented at the Venus boundary.  Do not
+    * ask an older MoltenVK to enable a feature bit it reports as unsupported;
+    * null handles themselves continue through the normal descriptor update
+    * and push-descriptor paths.
+    */
+   if (null_descriptor_enabled && physical_dev->is_null_descriptor_emulated)
+      robustness2->nullDescriptor = VK_FALSE;
 
    struct vkr_device *dev =
       vkr_context_alloc_object(ctx, sizeof(*dev), VK_OBJECT_TYPE_DEVICE, args->pDevice);
@@ -228,6 +244,11 @@ vkr_device_object_destroy(struct vkr_context *ctx,
    VkDevice device = dev->base.handle.device;
 
    assert(vkr_device_should_track_object(obj));
+
+   /* A mapped allocation must be unmapped while its VkDeviceMemory handle is
+    * still valid.  The normal vkFreeMemory path has the same ordering. */
+   if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
+      vkr_device_memory_release((struct vkr_device_memory *)obj);
 
    if (ctx->on_worker_thread) {
       switch (obj->type) {
@@ -310,9 +331,6 @@ vkr_device_object_destroy(struct vkr_context *ctx,
 
    /* always cleanup vkr allocs */
    switch (obj->type) {
-   case VK_OBJECT_TYPE_DEVICE_MEMORY:
-      vkr_device_memory_release((struct vkr_device_memory *)obj);
-      break;
    case VK_OBJECT_TYPE_DESCRIPTOR_POOL:
       /* Destroying VkDescriptorPool frees all VkDescriptorSet allocated inside. */
       vkr_descriptor_pool_release(ctx, (struct vkr_descriptor_pool *)obj);
@@ -326,6 +344,72 @@ vkr_device_object_destroy(struct vkr_context *ctx,
    };
 
    vkr_device_remove_object(ctx, dev, obj);
+}
+
+/* A context can disappear without the guest sending vkDestroy* for every
+ * object.  vkr still owns those host objects and must destroy them before the
+ * VkDevice.  dev->objects is newest-first, which is not a valid destruction
+ * order (VkDeviceMemory is commonly newer than the image or buffer bound to
+ * it), so forced teardown is split into dependency-ordered passes.
+ */
+static unsigned
+vkr_device_object_destroy_order(VkObjectType type)
+{
+   switch (type) {
+   /* Pools own untracked command-buffer and descriptor-set wrappers.  Objects
+    * which can refer to views, layouts, buffers, or images also go first. */
+   case VK_OBJECT_TYPE_COMMAND_POOL:
+   case VK_OBJECT_TYPE_DESCRIPTOR_POOL:
+   case VK_OBJECT_TYPE_FRAMEBUFFER:
+   case VK_OBJECT_TYPE_PIPELINE:
+   case VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE:
+   case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
+      return 0;
+
+   /* Views must precede their resources.  Samplers and image views must
+    * precede any VkSamplerYcbcrConversion used to create them. */
+   case VK_OBJECT_TYPE_BUFFER_VIEW:
+   case VK_OBJECT_TYPE_IMAGE_VIEW:
+   case VK_OBJECT_TYPE_SAMPLER:
+   case VK_OBJECT_TYPE_SEMAPHORE:
+   case VK_OBJECT_TYPE_FENCE:
+   case VK_OBJECT_TYPE_EVENT:
+   case VK_OBJECT_TYPE_QUERY_POOL:
+   case VK_OBJECT_TYPE_SHADER_MODULE:
+   case VK_OBJECT_TYPE_PIPELINE_CACHE:
+      return 1;
+
+   case VK_OBJECT_TYPE_PIPELINE_LAYOUT:
+   case VK_OBJECT_TYPE_RENDER_PASS:
+   case VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT:
+   case VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION:
+      return 2;
+
+   /* Bound resources must be destroyed before their backing memory. */
+   case VK_OBJECT_TYPE_BUFFER:
+   case VK_OBJECT_TYPE_IMAGE:
+      return 3;
+
+   case VK_OBJECT_TYPE_DEVICE_MEMORY:
+      return 4;
+
+   default:
+      vkr_log("Unhandled tracked VkObjectType(%u) during device teardown",
+              (uint32_t)type);
+      assert(false);
+      return 0;
+   }
+}
+
+static void
+vkr_device_destroy_objects(struct vkr_context *ctx, struct vkr_device *dev)
+{
+   for (unsigned order = 0; order <= 4; order++) {
+      list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head) {
+         if (vkr_device_object_destroy_order(obj->type) == order)
+            vkr_device_object_destroy(ctx, dev, obj);
+      }
+   }
 }
 
 void
@@ -344,18 +428,18 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
    }
 
-   mtx_destroy(&dev->object_mutex);
-
-   if (!list_is_empty(&dev->objects)) {
-      list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
-         vkr_device_object_destroy(ctx, dev, obj);
-   }
-
+   /* Queue sync threads can still wait on host fences.  Join them while the
+    * device and those fences are valid, after DeviceWaitIdle made progress
+    * finite. */
    list_for_each_entry_safe (struct vkr_queue, queue, &dev->queues, base.track_head)
       vkr_queue_destroy(ctx, queue);
 
+   if (!list_is_empty(&dev->objects))
+      vkr_device_destroy_objects(ctx, dev);
+
    list_for_each_entry_safe (struct vkr_queue_sync, sync, &dev->free_syncs, head) {
-      vk->DestroyFence(dev->base.handle.device, sync->fence, NULL);
+      if (ctx->on_worker_thread)
+         vk->DestroyFence(dev->base.handle.device, sync->fence, NULL);
       free(sync);
    }
 
@@ -363,6 +447,9 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
 
    if (destroy_vk || ctx->on_worker_thread)
       vk->DestroyDevice(device, NULL);
+
+   /* vkr_device_object_destroy() removes objects under this mutex. */
+   mtx_destroy(&dev->object_mutex);
 
    list_del(&dev->base.track_head);
 

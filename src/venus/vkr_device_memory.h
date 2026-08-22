@@ -32,11 +32,6 @@ struct vkr_device_memory {
    /* Set when memory is imported via VkImportMemoryResourceInfoMESA. */
    uint32_t import_resource_id;
 
-#ifdef __APPLE__
-   /* Compositor window buffers backed by IOSurface (iosurface_allowed ctx). */
-   IOSurfaceRef iosurface;
-#endif
-
    bool exported;
 };
 VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)

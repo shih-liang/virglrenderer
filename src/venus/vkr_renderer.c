@@ -181,8 +181,7 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              void **out_res_ptr,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info,
-                             void **out_res_iosurface)
+                             struct virgl_resource_vulkan_info *out_vulkan_info)
 {
    TRACE_FUNC();
 
@@ -201,19 +200,10 @@ vkr_renderer_create_resource(uint32_t ctx_id,
           blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP);
 
    *out_fd_type = blob.type;
-   if (out_res_iosurface)
-      *out_res_iosurface = NULL;
    if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
       *out_res_ptr = blob.u.metal_heap;
    } else {
-      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
-      if (res && res->is_host_mapping && res->u.data) {
-         *out_res_ptr = res->u.data;
-         if (out_res_iosurface && res->iosurface)
-            *out_res_iosurface = (void *)res->iosurface;
-      } else {
-         *out_res_fd = blob.u.fd;
-      }
+      *out_res_fd = blob.u.fd;
    }
    *out_map_info = blob.map_info;
 
@@ -247,23 +237,22 @@ vkr_renderer_import_resource(uint32_t ctx_id,
 }
 
 bool
-vkr_renderer_import_host_mapping(uint32_t ctx_id,
-                                 uint32_t res_id,
-                                 void *ptr,
-                                 uint64_t size,
-                                 void *iosurface)
+vkr_renderer_import_resource_metal(uint32_t ctx_id,
+                                   uint32_t res_id,
+                                   void *metal_heap,
+                                   uint64_t size)
 {
    TRACE_FUNC();
 
-   assert(res_id);
-   assert(ptr);
-   assert(size);
+   if (!res_id || !metal_heap || !size)
+      return false;
 
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
    if (!ctx)
       return false;
 
-   return vkr_context_import_host_mapping(ctx, res_id, ptr, size, iosurface);
+   return vkr_context_import_resource_metal(ctx, res_id, size,
+                                            VIRGL_RESOURCE_METAL_HEAP, metal_heap);
 }
 
 void
@@ -274,17 +263,4 @@ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
    if (ctx)
       vkr_context_destroy_resource(ctx, res_id);
-}
-
-void
-vkr_renderer_set_iosurface_allowed(uint32_t ctx_id, bool allowed)
-{
-#ifdef __APPLE__
-   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
-   if (ctx)
-      ctx->iosurface_allowed = allowed;
-#else
-   (void)ctx_id;
-   (void)allowed;
-#endif
 }

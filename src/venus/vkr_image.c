@@ -10,10 +10,6 @@
 #include "vkr_instance.h"
 #include "vkr_physical_device.h"
 
-#ifdef __APPLE__
-typedef VkResult (VKAPI_PTR *PFN_vkUseIOSurfaceMVK)(VkImage image, IOSurfaceRef ioSurface);
-#endif
-
 static void
 vkr_image_fix_create_info(struct vkr_device *dev,
                           VkImageCreateInfo *pCreateInfo)
@@ -23,13 +19,18 @@ vkr_image_fix_create_info(struct vkr_device *dev,
    ext_create_info = vkr_find_struct(
             pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    if (ext_create_info) {
-      /* strip out dmabuf */
-      if ((ext_create_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0) {
-         ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         /* add in supported handles */
-         if (dev->physical_device->is_metal_export_supported) {
-            ext_create_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
-         }
+      const VkExternalMemoryHandleTypeFlags fd_types =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      const VkExternalMemoryHandleTypeFlags guest_types =
+         ext_create_info->handleTypes;
+      if (dev->physical_device->is_metal_export_supported &&
+          (guest_types & fd_types)) {
+         /* Linux fd handle types are guest transport semantics. MoltenVK uses
+          * an MTLHeap for the corresponding ordinary external allocation. */
+         ext_create_info->handleTypes &= ~fd_types;
+         ext_create_info->handleTypes |=
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
       }
    }
 }
@@ -76,15 +77,25 @@ static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateImage *args)
 {
+   struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
+   VkImageCreateInfo *create_info = (VkImageCreateInfo *)args->pCreateInfo;
+   const bool drm_format_modifier_emulated =
+      !dev->physical_device->EXT_image_drm_format_modifier &&
+      create_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 
+   const VkExternalMemoryImageCreateInfo *guest_external_info =
+      vkr_find_struct(create_info->pNext,
+                      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   const VkExternalMemoryHandleTypeFlags guest_external_handle_types =
+      guest_external_info ? guest_external_info->handleTypes : 0;
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pCreateInfo);
+      vkr_image_fix_create_info(dev, create_info);
    }
 
    if (!dev->physical_device->EXT_image_drm_format_modifier) {
-      args->ret = vkr_image_fix_drm_format(dev, (VkImageCreateInfo *)args->pCreateInfo);
+      args->ret = vkr_image_fix_drm_format(dev, create_info);
       if (args->ret != VK_SUCCESS) {
          return;
       }
@@ -109,13 +120,16 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
-   vkr_image_create_and_add(dispatch->data, args);
-   if (args->ret == VK_SUCCESS && args->pImage && args->pCreateInfo) {
-      struct vkr_image *img = vkr_image_from_handle(*args->pImage);
-      if (img) {
-         img->width = args->pCreateInfo->extent.width;
-         img->height = args->pCreateInfo->extent.height;
-      }
+   struct vkr_image *img = vkr_image_create_and_add(ctx, args);
+   /* pImage now contains the driver VkImage handle, not a vkr_image pointer.
+    * Keep renderer-only metadata on the object returned by the generator. */
+   if (img && args->ret == VK_SUCCESS && args->pCreateInfo) {
+      img->width = args->pCreateInfo->extent.width;
+      img->height = args->pCreateInfo->extent.height;
+      img->format = args->pCreateInfo->format;
+      img->usage = args->pCreateInfo->usage;
+      img->external_handle_types = guest_external_handle_types;
+      img->drm_format_modifier_emulated = drm_format_modifier_emulated;
    }
 }
 
@@ -179,41 +193,15 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
-   struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
    vn_replace_vkBindImageMemory_args_handle(args);
    args->ret =
       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
-
-#ifdef __APPLE__
-   if (args->ret == VK_SUCCESS && ctx->instance) {
-      IOSurfaceRef iosurface = NULL;
-      if (mem && mem->import_resource_id) {
-         struct vkr_resource *res =
-            vkr_context_get_resource(ctx, mem->import_resource_id);
-         if (res && res->iosurface)
-            iosurface = res->iosurface;
-      } else if (mem && mem->iosurface) {
-         iosurface = mem->iosurface;
-      }
-      if (iosurface) {
-         PFN_vkUseIOSurfaceMVK use_io = (PFN_vkUseIOSurfaceMVK)
-            ctx->vulkan_library.GetInstanceProcAddr(
-               ctx->instance->base.handle.instance, "vkUseIOSurfaceMVK");
-         if (use_io) {
-            VkResult ios_ret = use_io(args->image, iosurface);
-            if (ios_ret != VK_SUCCESS)
-               args->ret = ios_ret;
-         }
-      }
-   }
-#endif
 }
 
 static void
@@ -234,6 +222,13 @@ vkr_dispatch_vkGetImageSubresourceLayout(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   const struct vkr_image *img = vkr_image_from_handle(args->image);
+
+   if (img && img->drm_format_modifier_emulated) {
+      VkImageSubresource *subresource = (VkImageSubresource *)args->pSubresource;
+      if (subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+         subresource->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   }
 
    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
@@ -247,6 +242,14 @@ vkr_dispatch_vkGetImageSubresourceLayout2(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   const struct vkr_image *img = vkr_image_from_handle(args->image);
+
+   if (img && img->drm_format_modifier_emulated) {
+      VkImageSubresource2 *subresource = (VkImageSubresource2 *)args->pSubresource;
+      if (subresource->imageSubresource.aspectMask ==
+          VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+         subresource->imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   }
 
    vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
    vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
@@ -263,7 +266,17 @@ vkr_dispatch_vkGetDeviceImageSubresourceLayout(
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+      vkr_image_fix_create_info(dev,
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+   }
+
+   if (!dev->physical_device->EXT_image_drm_format_modifier &&
+       args->pInfo->pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+      VkImageSubresource2 *subresource =
+         (VkImageSubresource2 *)args->pInfo->pSubresource;
+      if (subresource->imageSubresource.aspectMask ==
+          VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+         subresource->imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
    }
 
    vn_replace_vkGetDeviceImageSubresourceLayout_args_handle(args);
@@ -335,7 +348,7 @@ vkr_dispatch_vkDestroySamplerYcbcrConversion(
 
 static void
 vkr_dispatch_vkGetDeviceImageMemoryRequirements(
-   UNUSED struct vn_dispatch_context *ctx,
+   UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetDeviceImageMemoryRequirements *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -343,7 +356,8 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+      vkr_image_fix_create_info(dev,
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
    }
 
    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
@@ -353,7 +367,7 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
 
 static void
 vkr_dispatch_vkGetDeviceImageSparseMemoryRequirements(
-   UNUSED struct vn_dispatch_context *ctx,
+   UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetDeviceImageSparseMemoryRequirements *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -361,7 +375,8 @@ vkr_dispatch_vkGetDeviceImageSparseMemoryRequirements(
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_image_fix_create_info(dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+      vkr_image_fix_create_info(dev,
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
    }
 
    vn_replace_vkGetDeviceImageSparseMemoryRequirements_args_handle(args);

@@ -10,21 +10,34 @@
 
 static void
 vkr_buffer_fix_create_info(struct vkr_device *dev,
-                           VkBufferCreateInfo *pCreateInfo)
+                           VkBufferCreateInfo *pCreateInfo,
+                           VkExternalMemoryBufferCreateInfo *local_external)
 {
    VkExternalMemoryBufferCreateInfo *ext_create_info;
 
    ext_create_info = vkr_find_struct(
             pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
    if (ext_create_info) {
-      /* strip out dmabuf */
-      if ((ext_create_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0) {
-         ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         /* add in supported handles */
-         if (dev->physical_device->is_metal_export_supported) {
-            ext_create_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-         }
+      const VkExternalMemoryHandleTypeFlags fd_types =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      if ((ext_create_info->handleTypes & fd_types) != 0 &&
+          dev->physical_device->is_metal_export_supported) {
+         ext_create_info->handleTypes &= ~fd_types;
+         ext_create_info->handleTypes |=
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
       }
+   } else if (dev->physical_device->is_metal_export_supported) {
+      /* Host-visible Venus allocations are exported from MoltenVK as
+       * MTLHeap-backed blobs.  Declare that handle type on the buffer too;
+       * binding external memory to an ordinary buffer is invalid Vulkan and
+       * is rejected by current validation layers. */
+      *local_external = (VkExternalMemoryBufferCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+         .pNext = pCreateInfo->pNext,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+      };
+      pCreateInfo->pNext = local_external;
    }
 }
 
@@ -33,10 +46,12 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCreateBuffer *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
+   VkExternalMemoryBufferCreateInfo local_external = { 0 };
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo);
+      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo,
+                                 &local_external);
    }
 
    /* XXX If VkExternalMemoryBufferCreateInfo is chained by the app, all is
@@ -165,10 +180,12 @@ vkr_dispatch_vkGetDeviceBufferMemoryRequirements(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   VkExternalMemoryBufferCreateInfo local_external = { 0 };
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pInfo->pCreateInfo);
+      vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pInfo->pCreateInfo,
+                                 &local_external);
    }
 
    vn_replace_vkGetDeviceBufferMemoryRequirements_args_handle(args);

@@ -12,45 +12,7 @@
 #include "vkr_physical_device.h"
 
 #ifdef __APPLE__
-#include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
-
-static IOSurfaceRef
-vkr_create_iosurface_bgra(uint32_t width, uint32_t height, uint32_t bytes_per_row,
-                          size_t *out_size)
-{
-   bytes_per_row = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, bytes_per_row);
-   if (!width || !height || !bytes_per_row)
-      return NULL;
-
-   CFNumberRef width_num = CFNumberCreate(NULL, kCFNumberIntType, &width);
-   CFNumberRef height_num = CFNumberCreate(NULL, kCFNumberIntType, &height);
-   uint32_t bytes_per_element = 4;
-   CFNumberRef bpe_num = CFNumberCreate(NULL, kCFNumberIntType, &bytes_per_element);
-   CFNumberRef bpr_num = CFNumberCreate(NULL, kCFNumberIntType, &bytes_per_row);
-   const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
-                          kIOSurfaceBytesPerRow, kIOSurfacePixelFormat };
-   const void *values[] = { width_num, height_num, bpe_num, bpr_num,
-                            (void *)(uintptr_t)kCVPixelFormatType_32BGRA };
-   CFDictionaryRef props =
-      CFDictionaryCreate(NULL, keys, values, ARRAY_SIZE(keys),
-                         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-   CFRelease(width_num);
-   CFRelease(height_num);
-   CFRelease(bpe_num);
-   CFRelease(bpr_num);
-   if (!props)
-      return NULL;
-
-   IOSurfaceRef surface = IOSurfaceCreate(props);
-   CFRelease(props);
-   if (!surface)
-      return NULL;
-
-   if (out_size)
-      *out_size = IOSurfaceGetAllocSize(surface);
-   return surface;
-}
 #endif
 
 static bool
@@ -383,13 +345,20 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+#ifdef __APPLE__
+   /* VZVirtioSharedMemoryRegion requires address, offset, and length to use
+    * the 16 KiB host page.  The guest interposer rounds every mappable blob
+    * CREATE to the same boundary.  Grow the actual host-visible Vulkan
+    * allocation here as well so vkr never exports an aperture larger than its
+    * backing allocation.  Imported resources already have fixed ownership and
+    * must preserve their advertised size. */
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info)
+      alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
+#endif
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-#ifdef __APPLE__
-   IOSurfaceRef iosurface_backing = NULL;
-#endif
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
@@ -464,53 +433,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
          alloc_info->pNext = &local_import_info;
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
-#ifdef __APPLE__
-      } else if (ctx->iosurface_allowed && might_export) {
-         const VkMemoryDedicatedAllocateInfo *ded =
-            vkr_find_struct(alloc_info->pNext,
-                            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
-         if (ded && ded->image != VK_NULL_HANDLE) {
-            struct vkr_image *img = vkr_image_from_handle(ded->image);
-            if (img && img->width && img->height) {
-               const uint32_t stride = (img->width * 4u + 127u) & ~127u;
-               size_t surface_size = 0;
-               iosurface_backing =
-                  vkr_create_iosurface_bgra(img->width, img->height, stride, &surface_size);
-               if (iosurface_backing) {
-                  void *base = IOSurfaceGetBaseAddress(iosurface_backing);
-                  if (!base) {
-                     CFRelease(iosurface_backing);
-                     iosurface_backing = NULL;
-                  } else {
-                     if (surface_size > alloc_info->allocationSize)
-                        alloc_info->allocationSize = surface_size;
-                     local_host_import_info = (VkImportMemoryHostPointerInfoEXT){
-                        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
-                        .handleType =
-                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                        .pHostPointer = base,
-                     };
-                     local_host_import_info.pNext = alloc_info->pNext;
-                     alloc_info->pNext = &local_host_import_info;
-                     if (export_info) {
-                        export_info->handleTypes &=
-                           ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-                        export_info->handleTypes |=
-                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-                     } else {
-                        local_export_info = (const VkExportMemoryAllocateInfo){
-                           .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-                           .pNext = alloc_info->pNext,
-                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-                        };
-                        export_info = &local_export_info;
-                     }
-                     valid_fd_types = 1 << VIRGL_RESOURCE_FD_OPAQUE;
-                  }
-               }
-            }
-         }
-#endif
       } else if (physical_dev->is_metal_export_supported) {
          assert(physical_dev->is_dma_buf_emulated);
          /* Align to 4KiB, which is what Linux expects */
@@ -528,8 +450,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    }
 
    if (export_info) {
-      if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported &&
-          !ctx->iosurface_allowed) {
+      /* Linux fd exports are guest transport semantics. MoltenVK exposes the
+       * corresponding ordinary allocation as an MTLHeap on macOS. */
+      if (physical_dev->is_dma_buf_emulated &&
+          physical_dev->is_metal_export_supported) {
          export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
          export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
          export_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
@@ -561,9 +485,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->memory_type_index = mem_type_index;
    if (res_info)
       mem->import_resource_id = res_info->resourceId;
-#ifdef __APPLE__
-   mem->iosurface = iosurface_backing;
-#endif
 }
 
 static void
@@ -703,12 +624,6 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
       close(mem->udmabuf_fd);
-#ifdef __APPLE__
-   if (mem->iosurface) {
-      CFRelease(mem->iosurface);
-      mem->iosurface = NULL;
-   }
-#endif
 }
 
 bool
@@ -726,24 +641,6 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       vkr_log("mem has been exported");
       return false;
    }
-
-#ifdef __APPLE__
-   if (mem->iosurface) {
-      if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
-         const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-         if (!visible) {
-            vkr_log("iosurface mem cannot support mappable blob");
-            return false;
-         }
-      }
-      mem->exported = true;
-      *out_blob = (struct virgl_context_blob){
-         .type = VIRGL_RESOURCE_FD_SHM,
-         .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
-      };
-      return true;
-   }
-#endif
 
    uint32_t map_info = VIRGL_RENDERER_MAP_CACHE_NONE;
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {

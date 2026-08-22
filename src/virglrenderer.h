@@ -474,17 +474,6 @@ struct virgl_renderer_resource_import_blob_args
 VIRGL_EXPORT int
 virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_blob_args *args);
 
-#ifdef ENABLE_VENUS
-VIRGL_EXPORT int
-virgl_renderer_import_host_mapping(int ctx_id, int res_handle, void *ptr, uint64_t size,
-                                   void *iosurface);
-VIRGL_EXPORT void
-virgl_renderer_set_iosurface_allowed(int ctx_id, int allowed);
-
-VIRGL_EXPORT void *
-virgl_renderer_resource_host_iosurface(uint32_t res_handle);
-#endif
-
 #define VIRGL_RENDERER_FENCE_FLAG_MERGEABLE      (1 << 0)
 VIRGL_EXPORT int virgl_renderer_context_create_fence(uint32_t ctx_id,
                                                      uint32_t flags,

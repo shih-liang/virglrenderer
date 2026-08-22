@@ -24,9 +24,12 @@ struct vkr_physical_device {
    bool KHR_external_memory_fd;
    bool EXT_external_memory_dma_buf;
    bool EXT_external_memory_metal;
+   bool EXT_metal_objects;
    bool KHR_portability_subset;
    bool EXT_image_drm_format_modifier;
    bool EXT_queue_family_foreign;
+   bool robustness2;
+   bool is_null_descriptor_emulated;
 
    bool KHR_external_fence_fd;
 

@@ -345,6 +345,7 @@ proxy_context_get_blob(struct virgl_context *base,
     * attach_resource callback.
     */
    struct proxy_context *ctx = (struct proxy_context *)base;
+   memset(blob, 0, sizeof(*blob));
 
    const struct render_context_op_create_resource_request req = {
       .header.op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
@@ -375,15 +376,6 @@ proxy_context_get_blob(struct virgl_context *base,
 
       proxy_context_resource_add(ctx, res_id);
 
-      return 0;
-   } else if (!reply_fd_count && reply.res_ptr &&
-              reply.fd_type == VIRGL_RESOURCE_FD_SHM) {
-      blob->type = reply.fd_type;
-      blob->host_ptr = reply.res_ptr;
-      blob->host_iosurface = reply.res_iosurface;
-      blob->map_info = reply.map_info;
-
-      proxy_context_resource_add(ctx, res_id);
       return 0;
    } else if (!reply_fd_count) {
       proxy_log("invalid reply for blob %" PRIu64, blob_id);
@@ -468,13 +460,15 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    if (proxy_context_resource_find(ctx, res_id))
       return;
 
-   /* The current render protocol only supports importing dma-buf, shm or pipe resource
-    * that can be exported to dma-buf. A protocol change is needed when there exists use
-    * case for importing external Vulkan opaque resource.
+   /* Metal heap pointers can only cross the socket when the render worker is a
+    * thread in this process.  The receiving context retains the heap before the
+    * request completes, so its lifetime is independent of the creating context.
     */
    if (res->fd_type != VIRGL_RESOURCE_FD_INVALID &&
        res->fd_type != VIRGL_RESOURCE_FD_DMABUF &&
-       res->fd_type != VIRGL_RESOURCE_FD_SHM) {
+       res->fd_type != VIRGL_RESOURCE_FD_SHM &&
+       (res->fd_type != VIRGL_RESOURCE_METAL_HEAP ||
+        (proxy_renderer.flags & VIRGL_RENDERER_RENDER_SERVER))) {
       proxy_log("failed to attach res %d with fd_type %d", res_id, res->fd_type);
       return;
    }
@@ -509,9 +503,18 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .res_id = res_id,
       .fd_type = res_fd_type,
       .size = res_size,
+      .res_ptr = res_fd_type == VIRGL_RESOURCE_METAL_HEAP ? res->metal_heap : NULL,
    };
-   if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), &res_fd, 1))
+   const bool sent = res_fd_type == VIRGL_RESOURCE_METAL_HEAP
+                        ? proxy_socket_send_request(&ctx->socket, &req, sizeof(req))
+                        : proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
+                                                             &res_fd, 1);
+   if (!sent) {
       proxy_log("failed to attach res %d", res_id);
+      if (res_fd >= 0 && close_res_fd)
+         close(res_fd);
+      return;
+   }
 
    if (res_fd >= 0 && close_res_fd)
       close(res_fd);

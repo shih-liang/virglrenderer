@@ -53,12 +53,8 @@ virgl_resource_destroy_func(void *val)
 
    if (res->pipe_resource)
       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
-   if (res->host_iosurface)
-      CFRelease(res->host_iosurface);
    if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
       CFRelease(res->metal_heap);
-   else if (res->host_ptr)
-      assert(res->fd == -1);
    else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
       close(res->fd);
@@ -234,33 +230,6 @@ virgl_resource_create_from_metal_heap(UNUSED struct virgl_context *ctx,
    res->fd_type = VIRGL_RESOURCE_METAL_HEAP;
    res->metal_heap = (void *)CFRetain(metal_heap);
    res->vulkan_info = *vulkan_info;
-
-   return res;
-}
-
-struct virgl_resource *
-virgl_resource_create_from_host_ptr(uint32_t res_id,
-                                    void *host_ptr,
-                                    void *host_iosurface)
-{
-   struct virgl_resource *res;
-
-   if (!host_ptr)
-      return NULL;
-
-   res = virgl_resource_create(res_id);
-   if (!res)
-      return NULL;
-
-   res->fd_type = VIRGL_RESOURCE_FD_SHM;
-   res->fd = -1;
-   res->host_ptr = host_ptr;
-#ifdef __APPLE__
-   if (host_iosurface)
-      res->host_iosurface = (void *)CFRetain(host_iosurface);
-#else
-   (void)host_iosurface;
-#endif
 
    return res;
 }

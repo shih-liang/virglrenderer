@@ -51,9 +51,6 @@ struct virgl_context_blob {
 
    struct virgl_resource_vulkan_info vulkan_info;
 
-   /* In-process host mapping blobs (compositor IOSurface window buffers). */
-   void *host_ptr;
-   void *host_iosurface;
 };
 
 struct virgl_context;

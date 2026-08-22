@@ -13,6 +13,10 @@ struct vkr_image {
 
    uint32_t width;
    uint32_t height;
+   VkFormat format;
+   VkImageUsageFlags usage;
+   VkExternalMemoryHandleTypeFlags external_handle_types;
+   bool drm_format_modifier_emulated;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 

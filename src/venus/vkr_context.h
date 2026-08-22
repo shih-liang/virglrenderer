@@ -33,14 +33,6 @@ struct vkr_resource {
       MTLResource_id metal_heap;
    } u;
 
-#ifdef __APPLE__
-   /* Compositor window buffers: IOSurface registered for bind-mode blit. */
-   IOSurfaceRef iosurface;
-#endif
-
-   /* u.data points at host-owned memory (IOSurface base); do not munmap. */
-   bool is_host_mapping;
-
    size_t size;
 };
 
@@ -111,11 +103,6 @@ struct vkr_context {
    struct vkr_instance *instance;
    char *instance_name;
 
-#ifdef __APPLE__
-   /* Set when the compositor registers via the NativePipe window channel. */
-   bool iosurface_allowed;
-#endif
-
    struct list_head head;
    struct vulkan_library vulkan_library;
 };
@@ -157,11 +144,11 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint64_t size);
 
 bool
-vkr_context_import_host_mapping(struct vkr_context *ctx,
-                                uint32_t res_id,
-                                void *ptr,
-                                uint64_t size,
-                                void *iosurface);
+vkr_context_import_resource_metal(struct vkr_context *ctx,
+                                  uint32_t res_id,
+                                  uint64_t blob_size,
+                                  enum virgl_resource_fd_type fd_type,
+                                  void *metal_heap);
 
 void
 vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id);

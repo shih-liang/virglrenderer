@@ -300,9 +300,17 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->EXT_image_drm_format_modifier = true;
       } else if (!strcmp(props->extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
          physical_dev->EXT_queue_family_foreign = true;
+      } else if (!strcmp(props->extensionName, VK_KHR_ROBUSTNESS_2_EXTENSION_NAME)) {
+         physical_dev->robustness2 = true;
+      } else if (!strcmp(props->extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+         physical_dev->robustness2 = true;
       } else if (!strcmp(props->extensionName, VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME)) {
          physical_dev->EXT_external_memory_metal = true;
          /* hide from guest */
+         continue;
+      } else if (!strcmp(props->extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) {
+         physical_dev->EXT_metal_objects = true;
+         /* Host-only: used to obtain MoltenVK's MTLDevice. */
          continue;
       } else if (!strcmp(props->extensionName, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
          physical_dev->KHR_portability_subset = true;
@@ -362,6 +370,29 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 
    physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
    physical_dev->extension_count = advertised_count;
+
+#ifdef __APPLE__
+   /* MoltenVK accepts null descriptor writes and represents them as unbound
+    * Metal resources, but currently reports nullDescriptor as unsupported.
+    * Venus keeps that implementation detail on the host side so applications
+    * such as Zink can use sparse descriptor arrays through the guest API.
+    *
+    * Query the host instead of assuming this forever: when MoltenVK gains
+    * native support, the feature is passed through without emulation.
+    */
+   if (physical_dev->robustness2) {
+      VkPhysicalDeviceRobustness2FeaturesKHR robustness2 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR,
+      };
+      VkPhysicalDeviceFeatures2 features2 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+         .pNext = &robustness2,
+      };
+
+      vk->GetPhysicalDeviceFeatures2(handle, &features2);
+      physical_dev->is_null_descriptor_emulated = !robustness2.nullDescriptor;
+   }
+#endif
 }
 
 static void
@@ -715,6 +746,14 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
 
    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
+
+   if (physical_dev->is_null_descriptor_emulated) {
+      VkPhysicalDeviceRobustness2FeaturesKHR *robustness2 =
+         vkr_find_struct(args->pFeatures->pNext,
+                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR);
+      if (robustness2)
+         robustness2->nullDescriptor = VK_TRUE;
+   }
 }
 
 static void
@@ -812,8 +851,6 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
             prev_struct->pNext = drm_format_mod->pNext;
             vkr_log("emulating DRM_FORMAT_MOD_LINEAR with VK_IMAGE_TILING_LINEAR");
             pImageFormatInfo->tiling = VK_IMAGE_TILING_LINEAR;
-            pImageFormatInfo->usage &=
-               ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
          } else {
             vkr_log("only DRM_FORMAT_MOD_LINEAR is supported");
             args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -822,17 +859,21 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       }
    }
 
-   /* emulate handle for dmabuf */
+   /* Both Linux fd handle types share the same MTLHeap transport on macOS.
+    * Remember whether this was a guest-fd query so the host-only handle can be
+    * translated back to the complete compatible guest set. */
+   const VkExternalMemoryHandleTypeFlags emulated_fd_types =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+   const VkExternalMemoryHandleTypeFlagBits host_handle_type =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+   bool queried_emulated_fd = false;
    if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
       VkPhysicalDeviceExternalImageFormatInfo *info =
          vkr_find_struct(args->pImageFormatInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
-      if (info && info->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-         info->handleType &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         info->handleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
-      }
-      if (info && info->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-         info->handleType &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         info->handleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+      if (info && (info->handleType & emulated_fd_types)) {
+         queried_emulated_fd = true;
+         info->handleType = host_handle_type;
       }
    }
 
@@ -840,18 +881,19 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
 
-   /* emulate handle for dmabuf */
-   if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
+   if (queried_emulated_fd) {
       VkExternalImageFormatProperties *img_props = vkr_find_struct(
          args->pImageFormatProperties->pNext, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
-      VkExternalMemoryProperties *props = &img_props->externalMemoryProperties;
-      if (img_props && (props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT)) {
-         props->exportFromImportedHandleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
-         props->exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      }
-      if (img_props && (props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT)) {
-         props->compatibleHandleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
-         props->compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      if (img_props) {
+         VkExternalMemoryProperties *props = &img_props->externalMemoryProperties;
+         if (props->exportFromImportedHandleTypes & host_handle_type) {
+            props->exportFromImportedHandleTypes &= ~host_handle_type;
+            props->exportFromImportedHandleTypes |= emulated_fd_types;
+         }
+         if (props->compatibleHandleTypes & host_handle_type) {
+            props->compatibleHandleTypes &= ~host_handle_type;
+            props->compatibleHandleTypes |= emulated_fd_types;
+         }
       }
    }
 
@@ -888,16 +930,15 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
-   /* emulate handle for dmabuf */
+   const VkExternalMemoryHandleTypeFlags emulated_fd_types =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+   bool queried_emulated_fd = false;
    if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
       VkPhysicalDeviceExternalBufferInfo *info = (VkPhysicalDeviceExternalBufferInfo *)&args->pExternalBufferInfo;
-      if (info->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-         info->handleType &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         info->handleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-      }
-      if (info->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-         info->handleType &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         info->handleType |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+      if (info->handleType & emulated_fd_types) {
+         queried_emulated_fd = true;
+         info->handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
       }
    }
 
@@ -905,16 +946,15 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
    vk->GetPhysicalDeviceExternalBufferProperties(
       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
 
-   /* emulate handle for dmabuf */
-   if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
+   if (queried_emulated_fd) {
       VkExternalMemoryProperties *props = &args->pExternalBufferProperties->externalMemoryProperties;
       if (props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
          props->exportFromImportedHandleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-         props->exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         props->exportFromImportedHandleTypes |= emulated_fd_types;
       }
       if (props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
          props->compatibleHandleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
-         props->compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         props->compatibleHandleTypes |= emulated_fd_types;
       }
    }
 }

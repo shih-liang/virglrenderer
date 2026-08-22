@@ -227,13 +227,12 @@ render_state_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              void **out_res_ptr,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info,
-                             void **out_res_iosurface)
+                             struct virgl_resource_vulkan_info *out_vulkan_info)
 {
    SCOPE_LOCK_RENDERER();
    return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
                                        out_fd_type, out_res_fd, out_res_ptr, out_map_info,
-                                       out_vulkan_info, out_res_iosurface);
+                                       out_vulkan_info);
 }
 
 bool
@@ -245,6 +244,16 @@ render_state_import_resource(uint32_t ctx_id,
 {
    SCOPE_LOCK_RENDERER();
    return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size);
+}
+
+bool
+render_state_import_resource_metal(uint32_t ctx_id,
+                                   uint32_t res_id,
+                                   void *metal_heap,
+                                   uint64_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   return vkr_renderer_import_resource_metal(ctx_id, res_id, metal_heap, size);
 }
 
 void

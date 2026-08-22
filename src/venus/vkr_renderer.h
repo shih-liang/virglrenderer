@@ -63,8 +63,7 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              void **out_res_ptr,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info,
-                             void **out_res_iosurface);
+                             struct virgl_resource_vulkan_info *out_vulkan_info);
 
 bool
 vkr_renderer_import_resource(uint32_t ctx_id,
@@ -74,16 +73,12 @@ vkr_renderer_import_resource(uint32_t ctx_id,
                              uint64_t size);
 
 bool
-vkr_renderer_import_host_mapping(uint32_t ctx_id,
-                                 uint32_t res_id,
-                                 void *ptr,
-                                 uint64_t size,
-                                 void *iosurface);
+vkr_renderer_import_resource_metal(uint32_t ctx_id,
+                                   uint32_t res_id,
+                                   void *metal_heap,
+                                   uint64_t size);
 
 void
 vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
-
-void
-vkr_renderer_set_iosurface_allowed(uint32_t ctx_id, bool allowed);
 
 #endif /* VKR_RENDERER_H */

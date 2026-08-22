@@ -6,6 +6,7 @@
 #include "vkr_command_buffer.h"
 
 #include "vkr_command_buffer_gen.h"
+#include "vkr_physical_device.h"
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -20,6 +21,63 @@
       vn_replace_vk##cmd_name##_args_handle(args);                                       \
       _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
    } while (0)
+
+static void
+vkr_sanitize_foreign_queue_family_indices(struct vkr_command_buffer *cmd,
+                                          uint32_t buffer_barrier_count,
+                                          const VkBufferMemoryBarrier *buffer_barriers,
+                                          uint32_t image_barrier_count,
+                                          const VkImageMemoryBarrier *image_barriers)
+{
+   if (cmd->device->physical_device->EXT_queue_family_foreign)
+      return;
+
+   for (uint32_t i = 0; i < buffer_barrier_count; i++) {
+      VkBufferMemoryBarrier *barrier = (VkBufferMemoryBarrier *)&buffer_barriers[i];
+      if (barrier->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          barrier->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+         barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      }
+   }
+
+   for (uint32_t i = 0; i < image_barrier_count; i++) {
+      VkImageMemoryBarrier *barrier = (VkImageMemoryBarrier *)&image_barriers[i];
+      if (barrier->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          barrier->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+         barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      }
+   }
+}
+
+static void
+vkr_sanitize_foreign_queue_family_indices2(struct vkr_command_buffer *cmd,
+                                           const VkDependencyInfo *dependency_info)
+{
+   if (!dependency_info || cmd->device->physical_device->EXT_queue_family_foreign)
+      return;
+
+   for (uint32_t i = 0; i < dependency_info->bufferMemoryBarrierCount; i++) {
+      VkBufferMemoryBarrier2 *barrier =
+         (VkBufferMemoryBarrier2 *)&dependency_info->pBufferMemoryBarriers[i];
+      if (barrier->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          barrier->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+         barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      }
+   }
+
+   for (uint32_t i = 0; i < dependency_info->imageMemoryBarrierCount; i++) {
+      VkImageMemoryBarrier2 *barrier =
+         (VkImageMemoryBarrier2 *)&dependency_info->pImageMemoryBarriers[i];
+      if (barrier->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          barrier->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+         barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      }
+   }
+}
 
 static void
 vkr_dispatch_vkCreateCommandPool(struct vn_dispatch_context *dispatch,
@@ -434,6 +492,11 @@ static void
 vkr_dispatch_vkCmdWaitEvents(UNUSED struct vn_dispatch_context *dispatch,
                              struct vn_command_vkCmdWaitEvents *args)
 {
+   struct vkr_command_buffer *cmd =
+      vkr_command_buffer_from_handle(args->commandBuffer);
+   vkr_sanitize_foreign_queue_family_indices(
+      cmd, args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
+      args->imageMemoryBarrierCount, args->pImageMemoryBarriers);
    VKR_CMD_CALL(CmdWaitEvents, args, args->eventCount, args->pEvents, args->srcStageMask,
                 args->dstStageMask, args->memoryBarrierCount, args->pMemoryBarriers,
                 args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
@@ -444,6 +507,11 @@ static void
 vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdPipelineBarrier *args)
 {
+   struct vkr_command_buffer *cmd =
+      vkr_command_buffer_from_handle(args->commandBuffer);
+   vkr_sanitize_foreign_queue_family_indices(
+      cmd, args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
+      args->imageMemoryBarrierCount, args->pImageMemoryBarriers);
    VKR_CMD_CALL(CmdPipelineBarrier, args, args->srcStageMask, args->dstStageMask,
                 args->dependencyFlags, args->memoryBarrierCount, args->pMemoryBarriers,
                 args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
@@ -811,6 +879,9 @@ static void
 vkr_dispatch_vkCmdPipelineBarrier2(UNUSED struct vn_dispatch_context *ctx,
                                    struct vn_command_vkCmdPipelineBarrier2 *args)
 {
+   struct vkr_command_buffer *cmd =
+      vkr_command_buffer_from_handle(args->commandBuffer);
+   vkr_sanitize_foreign_queue_family_indices2(cmd, args->pDependencyInfo);
    VKR_CMD_CALL(CmdPipelineBarrier2, args, args->pDependencyInfo);
 }
 
@@ -825,6 +896,9 @@ static void
 vkr_dispatch_vkCmdSetEvent2(UNUSED struct vn_dispatch_context *ctx,
                             struct vn_command_vkCmdSetEvent2 *args)
 {
+   struct vkr_command_buffer *cmd =
+      vkr_command_buffer_from_handle(args->commandBuffer);
+   vkr_sanitize_foreign_queue_family_indices2(cmd, args->pDependencyInfo);
    VKR_CMD_CALL(CmdSetEvent2, args, args->event, args->pDependencyInfo);
 }
 
@@ -832,6 +906,10 @@ static void
 vkr_dispatch_vkCmdWaitEvents2(UNUSED struct vn_dispatch_context *ctx,
                               struct vn_command_vkCmdWaitEvents2 *args)
 {
+   struct vkr_command_buffer *cmd =
+      vkr_command_buffer_from_handle(args->commandBuffer);
+   for (uint32_t i = 0; i < args->eventCount; i++)
+      vkr_sanitize_foreign_queue_family_indices2(cmd, &args->pDependencyInfos[i]);
    VKR_CMD_CALL(CmdWaitEvents2, args, args->eventCount, args->pEvents,
                 args->pDependencyInfos);
 }
