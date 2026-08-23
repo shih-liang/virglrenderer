@@ -1541,7 +1541,11 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
    };
    MTLTexture_id tex;
 
-   if (!virgl_metal_retain_texture_from_heap(res->metal_heap,
+   /* A tiled VkImage has an exact MoltenVK MTLTexture, while a linear image
+    * (the compositor's wl_shm upload) is backed by an MTLBuffer. The helper
+    * first retains the exact texture and otherwise creates only a texture view
+    * of that same buffer. It never allocates overlapping heap storage. */
+   if (!virgl_metal_create_texture_from_heap(res->metal_heap,
                                              &desc,
                                              &tex))
       return VIRGL_NATIVE_HANDLE_NONE;
