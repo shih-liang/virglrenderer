@@ -29,9 +29,8 @@ bool virgl_metal_create_texture_from_heap(MTLHeap_id heap,
                                           const struct vrend_metal_texture_description *desc,
                                           MTLTexture_id *tex);
 
-/* Retains the exact texture MoltenVK created in this heap. This never creates
- * a texture view or storage and is the only valid NativePipe scanout source. */
-bool virgl_metal_retain_texture_from_heap(MTLHeap_id heap,
+/* Validate and retain an exact texture exported from the source VkImage. */
+bool virgl_metal_retain_texture(MTLTexture_id source,
                                           const struct vrend_metal_texture_description *desc,
                                           MTLTexture_id *tex);
 

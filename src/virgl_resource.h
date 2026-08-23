@@ -27,6 +27,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "c11/threads.h"
 
 struct iovec;
 struct pipe_resource;
@@ -100,8 +101,13 @@ struct virgl_resource {
    uint32_t opaque_handle_context_id;
    uint32_t opaque_handle;
 
-   /* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
-   void *metal_heap;
+	/* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
+	void *metal_heap;
+	/* Exact VkImage backing exported with VK_EXT_metal_objects. This is kept
+	 * separate from metal_heap because the heap remains the cross-context
+	 * memory transport while this texture is the displayable image identity. */
+	void *metal_texture;
+	mtx_t metal_texture_mutex;
 
    const struct iovec *iov;
    int iov_count;
@@ -171,6 +177,7 @@ struct virgl_resource *
 virgl_resource_create_from_metal_heap(struct virgl_context *ctx,
                                       uint32_t res_id,
                                       void *metal_heap,
+									  void *metal_texture,
                                       const struct virgl_resource_vulkan_info *vulkan_info);
 
 void
@@ -178,6 +185,12 @@ virgl_resource_remove(uint32_t res_id);
 
 struct virgl_resource *
 virgl_resource_lookup(uint32_t res_id);
+
+bool
+virgl_resource_set_metal_texture(uint32_t res_id, void *metal_texture);
+
+void *
+virgl_resource_retain_metal_texture(struct virgl_resource *res);
 
 int
 virgl_resource_attach_iov(struct virgl_resource *res,

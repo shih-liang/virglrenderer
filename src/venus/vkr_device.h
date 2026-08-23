@@ -17,7 +17,8 @@ struct vkr_device {
 
    struct vkr_physical_device *physical_device;
 
-   struct vn_device_proc_table proc_table;
+	struct vn_device_proc_table proc_table;
+	PFN_vkExportMetalObjectsEXT export_metal_objects;
 
    struct list_head queues;
 

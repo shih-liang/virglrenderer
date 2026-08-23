@@ -32,7 +32,15 @@ struct vkr_device_memory {
    /* Set when memory is imported via VkImportMemoryResourceInfoMESA. */
    uint32_t import_resource_id;
 
-   bool exported;
+	bool exported;
+	/* Global virgl resource created from this allocation. The resource can be
+	 * created before or after VkBindImageMemory, so texture publication must
+	 * support both orderings. */
+	uint32_t export_resource_id;
+
+	/* Images actually bound to this allocation. An exported Metal texture is
+	 * available only when this list identifies one unambiguous external image. */
+	struct list_head bound_images;
 };
 VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
 
@@ -41,6 +49,9 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx);
 
 void
 vkr_device_memory_release(struct vkr_device_memory *mem);
+
+void
+vkr_device_memory_publish_metal_texture(struct vkr_device_memory *mem);
 
 bool
 vkr_device_memory_export_blob(struct vkr_device_memory *mem,

@@ -235,18 +235,7 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
          (props.externalMemoryProperties.exportFromImportedHandleTypes &
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
-      /* MoltenVK often omits buffer-level MTLHEAP exportability in
-       * ExternalBufferProperties while still honouring
-       * VkExportMemoryAllocateInfo + GetMemoryMetalHandleEXT for Venus
-       * image memory. Without this, emulated dma_buf stays on the FD path
-       * and DEVICE_LOCAL exports try to map private GPU memory.
-       */
-      if (!physical_dev->is_metal_export_supported) {
-         vkr_log("forcing is_metal_export_supported (props features=0x%x)",
-                 props.externalMemoryProperties.externalMemoryFeatures);
-         physical_dev->is_metal_export_supported = true;
-      }
-   }
+	}
 
    /* fallback to gbm allocation with dma-buf import */
    if (!physical_dev->is_dma_buf_fd_export_supported &&
@@ -851,6 +840,15 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
             prev_struct->pNext = drm_format_mod->pNext;
             vkr_log("emulating DRM_FORMAT_MOD_LINEAR with VK_IMAGE_TILING_LINEAR");
             pImageFormatInfo->tiling = VK_IMAGE_TILING_LINEAR;
+            /* Mesa WSI uses this query while configuring its buffer-blit
+             * presentation image.  The linear image is the transfer-backed
+             * presentation buffer, not the color/input attachment that the
+             * application renders into.  MoltenVK correctly rejects linear
+             * color attachments, so do not ask the host for usages that are
+             * served by WSI's separate render image. */
+            pImageFormatInfo->usage &=
+               ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
          } else {
             vkr_log("only DRM_FORMAT_MOD_LINEAR is supported");
             args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;

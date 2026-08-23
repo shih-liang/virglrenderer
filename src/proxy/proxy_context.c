@@ -370,7 +370,8 @@ proxy_context_get_blob(struct virgl_context *base,
 
    if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP) {
       blob->type = reply.fd_type;
-      blob->u.metal_heap = reply.res_ptr;
+		blob->u.metal_heap = reply.res_ptr;
+		blob->metal_texture = reply.texture_ptr;
       blob->map_info = reply.map_info;
       blob->vulkan_info = reply.vulkan_info;
 

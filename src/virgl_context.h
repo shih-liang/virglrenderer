@@ -49,7 +49,11 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
-   struct virgl_resource_vulkan_info vulkan_info;
+	struct virgl_resource_vulkan_info vulkan_info;
+
+	/* Optional exact Metal texture exported from the VkImage bound to this
+	 * allocation. The pointer is valid only for in-process Metal renderers. */
+	void *metal_texture;
 
 };
 

@@ -150,8 +150,10 @@ struct render_context_op_create_resource_reply {
    uint32_t map_info; /* VIRGL_RENDERER_MAP_* */
    /* vulkan_info is set if the fd_type is opaque or Metal */
    struct virgl_resource_vulkan_info vulkan_info;
-   /* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
-   void *res_ptr;
+	/* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
+	void *res_ptr;
+	/* Exact image texture, valid only for an in-process render server. */
+	void *texture_ptr;
    /* otherwise followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
 };
 

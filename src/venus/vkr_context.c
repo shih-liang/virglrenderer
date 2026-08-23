@@ -359,6 +359,7 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    struct virgl_context_blob blob;
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
+	mem->export_resource_id = res_id;
 
    if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
       *out_blob = blob;

@@ -119,8 +119,9 @@ render_context_dispatch_create_resource(struct render_context *ctx,
    };
    int res_fd = -1;
    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
-                                          req->blob_size, req->blob_flags, &reply.fd_type,
-                                          &res_fd, &reply.res_ptr, &reply.map_info,
+										  req->blob_size, req->blob_flags, &reply.fd_type,
+										  &res_fd, &reply.res_ptr, &reply.texture_ptr,
+										  &reply.map_info,
                                           &reply.vulkan_info);
    if (!ok)
       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
@@ -134,8 +135,9 @@ render_context_dispatch_create_resource(struct render_context *ctx,
          /* not in_process, cannot send pointers */
          render_log("cannot send pointer for resource %d", req->res_id);
          render_state_destroy_resource(ctx->ctx_id, req->res_id);
-         reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
-         reply.res_ptr = NULL;
+		 reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
+		 reply.res_ptr = NULL;
+		 reply.texture_ptr = NULL;
       }
       ok = render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
    }

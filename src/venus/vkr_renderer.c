@@ -180,6 +180,7 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              enum virgl_resource_fd_type *out_fd_type,
                              int *out_res_fd,
                              void **out_res_ptr,
+							 void **out_texture_ptr,
                              uint32_t *out_map_info,
                              struct virgl_resource_vulkan_info *out_vulkan_info)
 {
@@ -200,8 +201,9 @@ vkr_renderer_create_resource(uint32_t ctx_id,
           blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP);
 
    *out_fd_type = blob.type;
-   if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
-      *out_res_ptr = blob.u.metal_heap;
+	if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
+		*out_res_ptr = blob.u.metal_heap;
+		*out_texture_ptr = blob.metal_texture;
    } else {
       *out_res_fd = blob.u.fd;
    }

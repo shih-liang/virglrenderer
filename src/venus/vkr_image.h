@@ -15,10 +15,19 @@ struct vkr_image {
    uint32_t height;
    VkFormat format;
    VkImageUsageFlags usage;
-   VkExternalMemoryHandleTypeFlags external_handle_types;
-   bool drm_format_modifier_emulated;
+	VkExternalMemoryHandleTypeFlags external_handle_types;
+	bool drm_format_modifier_emulated;
+
+	/* Host-side mirror of Vulkan's image-memory binding. It is used only to
+	 * identify the exact VkImage behind an exported virtio resource. */
+	struct vkr_device_memory *bound_memory;
+	VkDeviceSize memory_offset;
+	struct list_head memory_head;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+
+void
+vkr_image_release(struct vkr_image *img);
 
 struct vkr_image_view {
    struct vkr_object base;

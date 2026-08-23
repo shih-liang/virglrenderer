@@ -53,11 +53,19 @@ virgl_resource_destroy_func(void *val)
 
    if (res->pipe_resource)
       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
-   if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
-      CFRelease(res->metal_heap);
-   else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+	if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP) {
+		CFRelease(res->metal_heap);
+	} else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
       close(res->fd);
+
+	mtx_lock(&res->metal_texture_mutex);
+	void *metal_texture = res->metal_texture;
+	res->metal_texture = NULL;
+	mtx_unlock(&res->metal_texture_mutex);
+	if (metal_texture)
+		CFRelease(metal_texture);
+	mtx_destroy(&res->metal_texture_mutex);
 
    free(res);
 }
@@ -100,11 +108,16 @@ virgl_resource_create(uint32_t res_id)
    res = calloc(1, sizeof(*res));
    if (!res)
       return NULL;
+	if (mtx_init(&res->metal_texture_mutex, mtx_plain) != thrd_success) {
+		free(res);
+		return NULL;
+	}
 
    err = util_hash_table_set(virgl_resource_table,
                              uintptr_to_pointer(res_id),
                              res);
    if (err != PIPE_OK) {
+		mtx_destroy(&res->metal_texture_mutex);
       free(res);
       return NULL;
    }
@@ -219,6 +232,7 @@ struct virgl_resource *
 virgl_resource_create_from_metal_heap(UNUSED struct virgl_context *ctx,
                                       uint32_t res_id,
                                       void *metal_heap,
+									  void *metal_texture,
                                       const struct virgl_resource_vulkan_info *vulkan_info)
 {
    struct virgl_resource *res;
@@ -227,8 +241,9 @@ virgl_resource_create_from_metal_heap(UNUSED struct virgl_context *ctx,
    if (!res)
       return NULL;
 
-   res->fd_type = VIRGL_RESOURCE_METAL_HEAP;
-   res->metal_heap = (void *)CFRetain(metal_heap);
+	res->fd_type = VIRGL_RESOURCE_METAL_HEAP;
+	res->metal_heap = (void *)CFRetain(metal_heap);
+	virgl_resource_set_metal_texture(res_id, metal_texture);
    res->vulkan_info = *vulkan_info;
 
    return res;
@@ -244,6 +259,35 @@ struct virgl_resource *virgl_resource_lookup(uint32_t res_id)
 {
    return util_hash_table_get(virgl_resource_table,
                               uintptr_to_pointer(res_id));
+}
+
+bool
+virgl_resource_set_metal_texture(uint32_t res_id, void *metal_texture)
+{
+	struct virgl_resource *res = virgl_resource_lookup(res_id);
+	if (!res || res->fd_type != VIRGL_RESOURCE_METAL_HEAP)
+		return false;
+
+	void *retained = metal_texture ? (void *)CFRetain(metal_texture) : NULL;
+	mtx_lock(&res->metal_texture_mutex);
+	void *previous = res->metal_texture;
+	res->metal_texture = retained;
+	mtx_unlock(&res->metal_texture_mutex);
+	if (previous)
+		CFRelease(previous);
+	return true;
+}
+
+void *
+virgl_resource_retain_metal_texture(struct virgl_resource *res)
+{
+	if (!res || res->fd_type != VIRGL_RESOURCE_METAL_HEAP)
+		return NULL;
+
+	mtx_lock(&res->metal_texture_mutex);
+	void *retained = res->metal_texture ? (void *)CFRetain(res->metal_texture) : NULL;
+	mtx_unlock(&res->metal_texture_mutex);
+	return retained;
 }
 
 int

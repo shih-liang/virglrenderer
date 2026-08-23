@@ -11,10 +11,6 @@
 #include "vkr_image.h"
 #include "vkr_physical_device.h"
 
-#ifdef __APPLE__
-#include <IOSurface/IOSurface.h>
-#endif
-
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
                                    const VkImportMemoryResourceInfoMESA *res_info,
@@ -482,7 +478,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
    mem->allocation_size = alloc_info->allocationSize;
-   mem->memory_type_index = mem_type_index;
+	mem->memory_type_index = mem_type_index;
+	list_inithead(&mem->bound_images);
    if (res_info)
       mem->import_resource_id = res_info->resourceId;
 }
@@ -617,13 +614,73 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
       vkr_dispatch_vkGetMemoryResourcePropertiesMESA;
 }
 
+static void *
+vkr_device_memory_export_metal_texture(struct vkr_device_memory *mem);
+
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
-   if (mem->gbm_bo)
+	list_for_each_entry_safe (struct vkr_image, img, &mem->bound_images, memory_head)
+		vkr_image_release(img);
+	if (mem->export_resource_id)
+		virgl_resource_set_metal_texture(mem->export_resource_id, NULL);
+	if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
       close(mem->udmabuf_fd);
+}
+
+void
+vkr_device_memory_publish_metal_texture(struct vkr_device_memory *mem)
+{
+#ifdef __APPLE__
+	if (!mem || !mem->export_resource_id)
+		return;
+	virgl_resource_set_metal_texture(mem->export_resource_id,
+	                                 vkr_device_memory_export_metal_texture(mem));
+#else
+	(void)mem;
+#endif
+}
+
+static void *
+vkr_device_memory_export_metal_texture(struct vkr_device_memory *mem)
+{
+#ifdef __APPLE__
+	if (!mem->device->export_metal_objects)
+		return NULL;
+
+	const VkExternalMemoryHandleTypeFlags guest_fd_types =
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+	struct vkr_image *candidate = NULL;
+	list_for_each_entry (struct vkr_image, img, &mem->bound_images, memory_head) {
+		if (img->memory_offset != 0 ||
+		    !(img->external_handle_types & guest_fd_types))
+			continue;
+		if (candidate) {
+			vkr_log("device memory has multiple external image bindings; refusing scanout export");
+			return NULL;
+		}
+		candidate = img;
+	}
+	if (!candidate)
+		return NULL;
+
+	VkExportMetalTextureInfoEXT texture_info = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+		.image = candidate->base.handle.image,
+		.plane = VK_IMAGE_ASPECT_COLOR_BIT,
+	};
+	VkExportMetalObjectsInfoEXT objects_info = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+		.pNext = &texture_info,
+	};
+	mem->device->export_metal_objects(mem->device->base.handle.device, &objects_info);
+	return texture_info.mtlTexture;
+#else
+	return NULL;
+#endif
 }
 
 bool
@@ -763,9 +820,10 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       .vulkan_info = vulkan_info,
    };
 
-   if (fd_type == VIRGL_RESOURCE_METAL_HEAP) {
-      out_blob->u.metal_heap = metal_heap;
-   } else {
+	if (fd_type == VIRGL_RESOURCE_METAL_HEAP) {
+		out_blob->u.metal_heap = metal_heap;
+		out_blob->metal_texture = vkr_device_memory_export_metal_texture(mem);
+	} else {
       out_blob->u.fd = fd;
    }
 

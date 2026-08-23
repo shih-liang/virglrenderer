@@ -11,6 +11,32 @@
 #include "vkr_physical_device.h"
 
 static void
+vkr_image_track_memory(struct vkr_image *img,
+					   struct vkr_device_memory *mem,
+					   VkDeviceSize offset)
+{
+	vkr_image_release(img);
+	img->bound_memory = mem;
+	img->memory_offset = offset;
+	list_addtail(&img->memory_head, &mem->bound_images);
+	vkr_device_memory_publish_metal_texture(mem);
+}
+
+void
+vkr_image_release(struct vkr_image *img)
+{
+	if (!img || !img->bound_memory)
+		return;
+
+	struct vkr_device_memory *mem = img->bound_memory;
+	list_del(&img->memory_head);
+	list_inithead(&img->memory_head);
+	img->bound_memory = NULL;
+	img->memory_offset = 0;
+	vkr_device_memory_publish_metal_texture(mem);
+}
+
+static void
 vkr_image_fix_create_info(struct vkr_device *dev,
                           VkImageCreateInfo *pCreateInfo)
 {
@@ -123,7 +149,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    struct vkr_image *img = vkr_image_create_and_add(ctx, args);
    /* pImage now contains the driver VkImage handle, not a vkr_image pointer.
     * Keep renderer-only metadata on the object returned by the generator. */
-   if (img && args->ret == VK_SUCCESS && args->pCreateInfo) {
+	if (img && args->ret == VK_SUCCESS && args->pCreateInfo) {
+		list_inithead(&img->memory_head);
       img->width = args->pCreateInfo->extent.width;
       img->height = args->pCreateInfo->extent.height;
       img->format = args->pCreateInfo->format;
@@ -137,7 +164,9 @@ static void
 vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkDestroyImage *args)
 {
-   vkr_image_destroy_and_remove(dispatch->data, args);
+	struct vkr_image *img = vkr_image_from_handle(args->image);
+	vkr_image_release(img);
+	vkr_image_destroy_and_remove(dispatch->data, args);
 }
 
 static void
@@ -193,26 +222,55 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
-   struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vn_device_proc_table *vk = &dev->proc_table;
+	struct vkr_device *dev = vkr_device_from_handle(args->device);
+	struct vn_device_proc_table *vk = &dev->proc_table;
+	struct vkr_image *img = vkr_image_from_handle(args->image);
+	struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+	const VkDeviceSize offset = args->memoryOffset;
 
-   vn_replace_vkBindImageMemory_args_handle(args);
-   args->ret =
-      vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+	vn_replace_vkBindImageMemory_args_handle(args);
+	args->ret =
+		vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+	if (args->ret == VK_SUCCESS && img && mem)
+		vkr_image_track_memory(img, mem, offset);
 }
 
 static void
-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkBindImageMemory2 *args)
 {
-   struct vkr_device *dev = vkr_device_from_handle(args->device);
-   struct vn_device_proc_table *vk = &dev->proc_table;
+	struct vkr_device *dev = vkr_device_from_handle(args->device);
+	struct vn_device_proc_table *vk = &dev->proc_table;
+	struct image_memory_binding {
+		struct vkr_image *img;
+		struct vkr_device_memory *mem;
+		VkDeviceSize offset;
+	};
+	struct image_memory_binding *bindings =
+		calloc(args->bindInfoCount, sizeof(*bindings));
+	if (args->bindInfoCount && !bindings) {
+		args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+		return;
+	}
+	for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+		bindings[i].img = vkr_image_from_handle(args->pBindInfos[i].image);
+		bindings[i].mem = vkr_device_memory_from_handle(args->pBindInfos[i].memory);
+		bindings[i].offset = args->pBindInfos[i].memoryOffset;
+	}
 
-   vn_replace_vkBindImageMemory2_args_handle(args);
-   args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+	vn_replace_vkBindImageMemory2_args_handle(args);
+	args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+	if (args->ret == VK_SUCCESS) {
+		for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+			if (bindings[i].img && bindings[i].mem)
+				vkr_image_track_memory(bindings[i].img, bindings[i].mem,
+									   bindings[i].offset);
+		}
+	}
+	free(bindings);
 }
 
 static void

@@ -9,32 +9,8 @@
 #include "vrend_metal.h"
 #include "pipe/p_state.h"
 #include "util/u_math.h"
-#include <dlfcn.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <Metal/Metal.h>
-
-typedef void *(*retain_heap_buffer_fn)(void *);
-typedef void *(*retain_heap_texture_fn)(void *);
-static retain_heap_buffer_fn retain_heap_buffer;
-static retain_heap_texture_fn retain_heap_texture;
-static pthread_once_t retain_heap_buffer_once = PTHREAD_ONCE_INIT;
-
-static void lookup_heap_buffer_accessor(void)
-{
-   /* vkr loads MoltenVK with RTLD_LOCAL, so its NativePipe accessors are not
-    * visible through RTLD_DEFAULT. np_venus interposes this leaf-name lookup
-    * to the MoltenVK already loaded from the application bundle. RTLD_NOLOAD
-    * guarantees that scanout never creates a second Vulkan implementation. */
-   void *mvk = dlopen("libMoltenVK.dylib", RTLD_LAZY | RTLD_NOLOAD);
-   retain_heap_buffer = (retain_heap_buffer_fn)dlsym(
-      mvk ? mvk : RTLD_DEFAULT, "np_mvk_retain_heap_backing_buffer");
-   retain_heap_texture = (retain_heap_texture_fn)dlsym(
-      mvk ? mvk : RTLD_DEFAULT, "np_mvk_retain_heap_render_texture");
-   if (getenv("NATIVEPIPE_GPU_TRACE"))
-      fprintf(stderr, "[metal] heap accessors buffer=%p texture=%p\n",
-              (void *)retain_heap_buffer, (void *)retain_heap_texture);
-}
 
 struct metal_format_conversion {
    uint32_t virgl_format;
@@ -132,21 +108,14 @@ bool virgl_metal_create_texture(MTLDevice_id device,
    return false;
 }
 
-bool virgl_metal_retain_texture_from_heap(MTLHeap_id heap,
+bool virgl_metal_retain_texture(MTLTexture_id source,
                                           const struct vrend_metal_texture_description *desc,
                                           MTLTexture_id *tex)
 {
-   id<MTLHeap> mtl_heap = (id<MTLHeap>)heap;
+   id<MTLTexture> render_texture = (id<MTLTexture>)source;
    MTLPixelFormat expected_format;
    *tex = nil;
-   if (!mtl_heap || !virgl_format_to_metal_format(desc->format, &expected_format))
-      return false;
-
-   pthread_once(&retain_heap_buffer_once, lookup_heap_buffer_accessor);
-   id<MTLTexture> render_texture = retain_heap_texture
-      ? (id<MTLTexture>)retain_heap_texture((void *)mtl_heap)
-      : nil;
-   if (!render_texture)
+   if (!render_texture || !virgl_format_to_metal_format(desc->format, &expected_format))
       return false;
 
    /* Scene allocations use aligned capacity; the published frame is the
@@ -156,12 +125,12 @@ bool virgl_metal_retain_texture_from_heap(MTLHeap_id heap,
        render_texture.pixelFormat == expected_format) {
       if (getenv("NATIVEPIPE_GPU_TRACE"))
          fprintf(stderr,
-                 "[metal] exact heap=%p render texture=%p %lux%lu row=%u format=%lu\n",
-                 (void *)mtl_heap, (void *)render_texture,
+                 "[metal] exact image texture=%p %lux%lu row=%u format=%lu\n",
+                 (void *)render_texture,
                  (unsigned long)render_texture.width,
                  (unsigned long)render_texture.height, desc->stride,
                  (unsigned long)render_texture.pixelFormat);
-      *tex = render_texture;
+      *tex = [render_texture retain];
       return true;
    }
 
@@ -172,7 +141,6 @@ bool virgl_metal_retain_texture_from_heap(MTLHeap_id heap,
               (unsigned long)render_texture.height,
               (unsigned long)render_texture.pixelFormat,
               desc->width, desc->height, (unsigned long)expected_format);
-   [render_texture release];
    return false;
 }
 
@@ -186,27 +154,21 @@ bool virgl_metal_create_texture_from_heap(MTLHeap_id heap,
    *tex = nil;
    if (descriptor) {
       NSUInteger deviceAlignment, bytesPerRow;
-      if (virgl_metal_retain_texture_from_heap(heap, desc, tex)) {
-         [descriptor release];
-         return true;
-      }
+	  /* This helper is for imported heap-backed compatibility resources, not
+	   * NativePipe scanout. Scanout uses virgl_metal_retain_texture(). */
+	  if (desc->format == VIRGL_FORMAT_B8G8R8X8_UNORM ||
+	      desc->format == VIRGL_FORMAT_B8G8R8A8_UNORM)
+		 descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
       /* Regardless of what we want, we have to respect the heap's options */
       descriptor.resourceOptions = mtl_heap.resourceOptions;
       deviceAlignment = [mtl_device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
       bytesPerRow = align(desc->stride, deviceAlignment);
-      /* MoltenVK backs a linear VkImage with an MTLBuffer allocated from this
-       * placement heap. Creating a second overlapping buffer here makes the
-       * original allocation aliasable/undefined when the guest reuses its
-       * swapchain image. Ask the bundled MoltenVK for the exact buffer and
-       * create only a texture view of it. If the accessor is unavailable,
-       * fail the export instead of constructing an overlapping allocation.
-       */
-      id<MTLBuffer> mtl_buffer = retain_heap_buffer
-         ? (id<MTLBuffer>)retain_heap_buffer((void *)mtl_heap)
-         : nil;
+      id<MTLBuffer> mtl_buffer = [mtl_heap newBufferWithLength:bytesPerRow * desc->height
+                                                       options:mtl_heap.resourceOptions
+                                                        offset:desc->offset];
       if (mtl_buffer) {
          *tex = [mtl_buffer newTextureWithDescriptor:descriptor
-                                              offset:desc->offset
+                                              offset:0
                                          bytesPerRow:bytesPerRow];
          [mtl_buffer release];
       }

@@ -1225,7 +1225,9 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       if (!res)
          return -ENOMEM;
    } else if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
-      res = virgl_resource_create_from_metal_heap(ctx, args->res_handle, blob.u.metal_heap, &blob.vulkan_info);
+		res = virgl_resource_create_from_metal_heap(ctx, args->res_handle,
+											 blob.u.metal_heap, blob.metal_texture,
+											 &blob.vulkan_info);
       if (!res)
          return -ENOMEM;
    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
@@ -1540,15 +1542,16 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
       .format = virgl_format,
    };
    MTLTexture_id tex;
+	MTLTexture_id source = virgl_resource_retain_metal_texture(res);
 
-   /* A tiled VkImage has an exact MoltenVK MTLTexture, while a linear image
-    * (the compositor's wl_shm upload) is backed by an MTLBuffer. The helper
-    * first retains the exact texture and otherwise creates only a texture view
-    * of that same buffer. It never allocates overlapping heap storage. */
-   if (!virgl_metal_create_texture_from_heap(res->metal_heap,
-                                             &desc,
-                                             &tex))
-      return VIRGL_NATIVE_HANDLE_NONE;
+	/* Scanout must use the exact texture exported from the VkImage. Recreating a
+	 * texture from the allocation heap loses the image's layout and identity. */
+	if (!source)
+		return VIRGL_NATIVE_HANDLE_NONE;
+	const bool valid = virgl_metal_retain_texture(source, &desc, &tex);
+	virgl_metal_release_texture(source);
+	if (!valid)
+		return VIRGL_NATIVE_HANDLE_NONE;
 
    *handle = tex;
    return VIRGL_NATIVE_HANDLE_METAL_TEXTURE;

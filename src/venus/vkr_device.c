@@ -11,6 +11,7 @@
 #include "vkr_context.h"
 #include "vkr_descriptor_set.h"
 #include "vkr_device_memory.h"
+#include "vkr_image.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue.h"
 
@@ -209,9 +210,14 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
 
    dev->physical_device = physical_dev;
 
-   vkr_device_init_proc_table(dev, physical_dev->api_version,
-                              args->pCreateInfo->ppEnabledExtensionNames,
-                              args->pCreateInfo->enabledExtensionCount);
+	vkr_device_init_proc_table(dev, physical_dev->api_version,
+	                           args->pCreateInfo->ppEnabledExtensionNames,
+	                           args->pCreateInfo->enabledExtensionCount);
+	if (physical_dev->EXT_metal_objects) {
+		dev->export_metal_objects = (PFN_vkExportMetalObjectsEXT)
+			physical_dev->proc_table.GetDeviceProcAddr(
+				dev->base.handle.device, "vkExportMetalObjectsEXT");
+	}
 
    free(exts);
 
@@ -247,8 +253,10 @@ vkr_device_object_destroy(struct vkr_context *ctx,
 
    /* A mapped allocation must be unmapped while its VkDeviceMemory handle is
     * still valid.  The normal vkFreeMemory path has the same ordering. */
-   if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
-      vkr_device_memory_release((struct vkr_device_memory *)obj);
+	if (obj->type == VK_OBJECT_TYPE_IMAGE)
+		vkr_image_release((struct vkr_image *)obj);
+	if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
+		vkr_device_memory_release((struct vkr_device_memory *)obj);
 
    if (ctx->on_worker_thread) {
       switch (obj->type) {
