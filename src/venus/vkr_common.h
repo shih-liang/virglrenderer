@@ -83,6 +83,9 @@
 #ifndef DRM_FORMAT_MOD_LINEAR
 #define DRM_FORMAT_MOD_LINEAR (0)
 #endif
+#ifndef DRM_FORMAT_MOD_APPLE_GPU_TILED
+#define DRM_FORMAT_MOD_APPLE_GPU_TILED UINT64_C(0x0c00000000000001)
+#endif
 
 struct vn_info_extension_table;
 struct vkr_context;

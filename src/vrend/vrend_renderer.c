@@ -14021,7 +14021,8 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
 #elif defined(ENABLE_METAL)
          int ret;
 
-         if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP) {
+         if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP &&
+             res->fd_type != VIRGL_RESOURCE_METAL_BUFFER) {
             FREE(gr);
             return EINVAL;
          }
@@ -14040,11 +14041,12 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          };
          MTLTexture_id texture;
          
-         if (!virgl_metal_create_texture_from_heap(res->metal_heap,
-                                                   &desc,
-                                                   &texture)) {
+         const bool created = res->fd_type == VIRGL_RESOURCE_METAL_HEAP
+            ? virgl_metal_create_texture_from_heap(res->metal_heap, &desc, &texture)
+            : virgl_metal_create_texture_from_buffer(res->metal_buffer, &desc, &texture);
+         if (!created) {
             FREE(gr);
-            virgl_error("%s: failed to create texture from MTLHeap\n", __func__);
+            virgl_error("%s: failed to create texture from Metal resource\n", __func__);
             return EINVAL;
          }
          gr->egl_image = virgl_egl_metal_image_from_texture(egl, texture);

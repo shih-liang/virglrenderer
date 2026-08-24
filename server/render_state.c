@@ -226,13 +226,13 @@ render_state_create_resource(uint32_t ctx_id,
                              enum virgl_resource_fd_type *out_fd_type,
                              int *out_res_fd,
                              void **out_res_ptr,
-							 void **out_texture_ptr,
+							 struct virgl_resource_metal_texture_state **out_texture_state,
                              uint32_t *out_map_info,
                              struct virgl_resource_vulkan_info *out_vulkan_info)
 {
    SCOPE_LOCK_RENDERER();
-   return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
-									   out_fd_type, out_res_fd, out_res_ptr, out_texture_ptr,
+	return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
+									   out_fd_type, out_res_fd, out_res_ptr, out_texture_state,
 									   out_map_info,
                                        out_vulkan_info);
 }
@@ -251,11 +251,13 @@ render_state_import_resource(uint32_t ctx_id,
 bool
 render_state_import_resource_metal(uint32_t ctx_id,
                                    uint32_t res_id,
-                                   void *metal_heap,
+                                   enum virgl_resource_fd_type fd_type,
+                                   void *metal_resource,
                                    uint64_t size)
 {
    SCOPE_LOCK_RENDERER();
-   return vkr_renderer_import_resource_metal(ctx_id, res_id, metal_heap, size);
+   return vkr_renderer_import_resource_metal(ctx_id, res_id, fd_type,
+                                             metal_resource, size);
 }
 
 void

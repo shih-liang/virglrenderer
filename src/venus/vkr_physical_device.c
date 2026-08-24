@@ -227,16 +227,6 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
    }
 
-   if (physical_dev->EXT_external_memory_metal) {
-      info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
-      vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
-      physical_dev->is_metal_export_supported =
-         (props.externalMemoryProperties.externalMemoryFeatures &
-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
-         (props.externalMemoryProperties.exportFromImportedHandleTypes &
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
-	}
-
    /* fallback to gbm allocation with dma-buf import */
    if (!physical_dev->is_dma_buf_fd_export_supported &&
        !physical_dev->is_opaque_fd_export_supported &&
@@ -426,18 +416,77 @@ vkr_physical_device_init_queue_family_properties(struct vkr_physical_device *phy
 }
 
 static void
-vkr_physical_device_emulate_drm_props(VkDrmFormatModifierPropertiesListEXT *drm_props_list)
+vkr_physical_device_emulate_drm_props(
+   VkDrmFormatModifierPropertiesListEXT *drm_props_list,
+   VkFormat format,
+   const VkFormatProperties *format_props)
 {
-    drm_props_list->drmFormatModifierCount = 1;
-    if (drm_props_list->pDrmFormatModifierProperties) {
-      drm_props_list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
+   const uint32_t capacity = drm_props_list->drmFormatModifierCount;
+   VkDrmFormatModifierPropertiesEXT props[2];
+   uint32_t prop_count = 0;
+
+   if ((format == VK_FORMAT_B8G8R8A8_UNORM ||
+        format == VK_FORMAT_B8G8R8A8_SRGB) &&
+       format_props->optimalTilingFeatures) {
+      props[prop_count++] = (VkDrmFormatModifierPropertiesEXT){
+         .drmFormatModifier = DRM_FORMAT_MOD_APPLE_GPU_TILED,
+         .drmFormatModifierPlaneCount = 1,
+         .drmFormatModifierTilingFeatures = format_props->optimalTilingFeatures,
+      };
+   }
+   if (format_props->linearTilingFeatures) {
+      props[prop_count++] = (VkDrmFormatModifierPropertiesEXT){
          .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
          .drmFormatModifierPlaneCount = 1,
-         .drmFormatModifierTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
+         .drmFormatModifierTilingFeatures = format_props->linearTilingFeatures,
       };
-    };
+   }
+
+   drm_props_list->drmFormatModifierCount = prop_count;
+   if (!drm_props_list->pDrmFormatModifierProperties)
+      return;
+
+   const uint32_t count = MIN2(capacity, prop_count);
+   memcpy(drm_props_list->pDrmFormatModifierProperties, props,
+          count * sizeof(props[0]));
+   drm_props_list->drmFormatModifierCount = count;
+}
+
+static void
+vkr_physical_device_emulate_drm_props2(
+   VkDrmFormatModifierPropertiesList2EXT *drm_props_list,
+   VkFormat format,
+   VkFormatFeatureFlags2 linear_features,
+   VkFormatFeatureFlags2 optimal_features)
+{
+   const uint32_t capacity = drm_props_list->drmFormatModifierCount;
+   VkDrmFormatModifierProperties2EXT props[2];
+   uint32_t prop_count = 0;
+
+   if ((format == VK_FORMAT_B8G8R8A8_UNORM ||
+        format == VK_FORMAT_B8G8R8A8_SRGB) && optimal_features) {
+      props[prop_count++] = (VkDrmFormatModifierProperties2EXT){
+         .drmFormatModifier = DRM_FORMAT_MOD_APPLE_GPU_TILED,
+         .drmFormatModifierPlaneCount = 1,
+         .drmFormatModifierTilingFeatures = optimal_features,
+      };
+   }
+   if (linear_features) {
+      props[prop_count++] = (VkDrmFormatModifierProperties2EXT){
+         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+         .drmFormatModifierPlaneCount = 1,
+         .drmFormatModifierTilingFeatures = linear_features,
+      };
+   }
+
+   drm_props_list->drmFormatModifierCount = prop_count;
+   if (!drm_props_list->pDrmFormatModifierProperties)
+      return;
+
+   const uint32_t count = MIN2(capacity, prop_count);
+   memcpy(drm_props_list->pDrmFormatModifierProperties, props,
+          count * sizeof(props[0]));
+   drm_props_list->drmFormatModifierCount = count;
 }
 
 static void
@@ -812,7 +861,25 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
       VkDrmFormatModifierPropertiesListEXT* drm_props_list =
          vkr_find_struct(args->pFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
       if (drm_props_list) {
-         vkr_physical_device_emulate_drm_props(drm_props_list);
+         vkr_physical_device_emulate_drm_props(
+            drm_props_list, args->format,
+            &args->pFormatProperties->formatProperties);
+      }
+      VkDrmFormatModifierPropertiesList2EXT *drm_props_list2 =
+         vkr_find_struct(args->pFormatProperties,
+                         VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+      if (drm_props_list2) {
+         const VkFormatProperties3 *format_props3 =
+            vkr_find_struct(args->pFormatProperties,
+                            VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3);
+         const VkFormatProperties *format_props =
+            &args->pFormatProperties->formatProperties;
+         vkr_physical_device_emulate_drm_props2(
+            drm_props_list2, args->format,
+            format_props3 ? format_props3->linearTilingFeatures
+                          : format_props->linearTilingFeatures,
+            format_props3 ? format_props3->optimalTilingFeatures
+                          : format_props->optimalTilingFeatures);
       }
    }
 }
@@ -825,6 +892,7 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+   bool emulated_apple_modifier = false;
 
    /* filter unsupported drm format modifiers */
    if (!physical_dev->EXT_image_drm_format_modifier) {
@@ -835,22 +903,27 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       if (prev_struct) {
          const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *drm_format_mod =
             (const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)prev_struct->pNext;
-         if (drm_format_mod->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
+         if (drm_format_mod->drmFormatModifier ==
+                DRM_FORMAT_MOD_APPLE_GPU_TILED &&
+             pImageFormatInfo->format != VK_FORMAT_B8G8R8A8_UNORM &&
+             pImageFormatInfo->format != VK_FORMAT_B8G8R8A8_SRGB) {
+            args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            return;
+         }
+         if (drm_format_mod->drmFormatModifier == DRM_FORMAT_MOD_LINEAR ||
+             drm_format_mod->drmFormatModifier == DRM_FORMAT_MOD_APPLE_GPU_TILED) {
             /* Remove the struct from the list */
             prev_struct->pNext = drm_format_mod->pNext;
-            vkr_log("emulating DRM_FORMAT_MOD_LINEAR with VK_IMAGE_TILING_LINEAR");
-            pImageFormatInfo->tiling = VK_IMAGE_TILING_LINEAR;
-            /* Mesa WSI uses this query while configuring its buffer-blit
-             * presentation image.  The linear image is the transfer-backed
-             * presentation buffer, not the color/input attachment that the
-             * application renders into.  MoltenVK correctly rejects linear
-             * color attachments, so do not ask the host for usages that are
-             * served by WSI's separate render image. */
-            pImageFormatInfo->usage &=
-               ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+            pImageFormatInfo->tiling =
+               drm_format_mod->drmFormatModifier == DRM_FORMAT_MOD_LINEAR
+                  ? VK_IMAGE_TILING_LINEAR
+                  : VK_IMAGE_TILING_OPTIMAL;
+            emulated_apple_modifier =
+               drm_format_mod->drmFormatModifier ==
+               DRM_FORMAT_MOD_APPLE_GPU_TILED;
          } else {
-            vkr_log("only DRM_FORMAT_MOD_LINEAR is supported");
+            vkr_log("unsupported emulated DRM format modifier 0x%" PRIx64,
+                    drm_format_mod->drmFormatModifier);
             args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
             return;
          }
@@ -866,7 +939,7 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    const VkExternalMemoryHandleTypeFlagBits host_handle_type =
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
    bool queried_emulated_fd = false;
-   if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
+   if (physical_dev->is_dma_buf_emulated) {
       VkPhysicalDeviceExternalImageFormatInfo *info =
          vkr_find_struct(args->pImageFormatInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
       if (info && (info->handleType & emulated_fd_types)) {
@@ -878,6 +951,14 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+   if (args->ret == VK_SUCCESS && emulated_apple_modifier) {
+      VkImageFormatProperties *props =
+         &args->pImageFormatProperties->imageFormatProperties;
+      props->maxMipLevels = MIN2(props->maxMipLevels, 1u);
+      props->maxArrayLayers = MIN2(props->maxArrayLayers, 1u);
+      props->sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
+   }
 
    if (queried_emulated_fd) {
       VkExternalImageFormatProperties *img_props = vkr_find_struct(
@@ -895,14 +976,6 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       }
    }
 
-   /* emulate support for drm format modifiers */
-   if (!physical_dev->EXT_image_drm_format_modifier) {
-      VkDrmFormatModifierPropertiesListEXT* drm_props_list =
-         vkr_find_struct(args->pImageFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
-      if (drm_props_list) {
-         vkr_physical_device_emulate_drm_props(drm_props_list);
-      }
-   }
 }
 
 static void
@@ -932,7 +1005,7 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
    bool queried_emulated_fd = false;
-   if (physical_dev->is_dma_buf_emulated && physical_dev->is_metal_export_supported) {
+   if (physical_dev->is_dma_buf_emulated) {
       /* The decoded command stores a pointer to the temporary Vulkan struct.
        * Taking the address of that pointer and treating the command fields as
        * VkPhysicalDeviceExternalBufferInfo corrupts adjacent arguments (most

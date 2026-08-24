@@ -15,8 +15,10 @@ struct vkr_image {
    uint32_t height;
    VkFormat format;
    VkImageUsageFlags usage;
-	VkExternalMemoryHandleTypeFlags external_handle_types;
-	bool drm_format_modifier_emulated;
+   VkExternalMemoryHandleTypeFlags external_handle_types;
+   bool metal_texture_exportable;
+   bool drm_format_modifier_emulated;
+   uint64_t drm_format_modifier;
 
 	/* Host-side mirror of Vulkan's image-memory binding. It is used only to
 	 * identify the exact VkImage behind an exported virtio resource. */

@@ -148,12 +148,12 @@ struct render_context_op_create_resource_request {
 struct render_context_op_create_resource_reply {
    enum virgl_resource_fd_type fd_type;
    uint32_t map_info; /* VIRGL_RENDERER_MAP_* */
-   /* vulkan_info is set if the fd_type is opaque or Metal */
+   /* vulkan_info is set for opaque fd and Metal heap resources. */
    struct virgl_resource_vulkan_info vulkan_info;
-	/* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
+	/* When fd_type is an in-process Metal resource. */
 	void *res_ptr;
-	/* Exact image texture, valid only for an in-process render server. */
-	void *texture_ptr;
+	/* Exact-image publication state, valid only in-process. */
+	struct virgl_resource_metal_texture_state *texture_state_ptr;
    /* otherwise followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
 };
 
@@ -168,7 +168,7 @@ struct render_context_op_import_resource_request {
    uint32_t res_id;
    enum virgl_resource_fd_type fd_type;
    uint64_t size;
-   /* Only valid for an in-process VIRGL_RESOURCE_METAL_HEAP import. */
+   /* Only valid for an in-process Metal resource import. */
    void *res_ptr;
    /* Otherwise followed by 1 fd. */
 };

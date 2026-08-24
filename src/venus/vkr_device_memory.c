@@ -298,6 +298,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
    VkImportMemoryMetalHandleInfoEXT local_metal_import_info = { 0 };
    VkImportMemoryHostPointerInfoEXT local_host_import_info = { 0 };
+   VkExportMetalObjectCreateInfoEXT local_metal_buffer_export_info = { 0 };
    VkImportMemoryResourceInfoMESA *res_info = NULL;
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
@@ -341,21 +342,16 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
-#ifdef __APPLE__
-   /* VZVirtioSharedMemoryRegion requires address, offset, and length to use
-    * the 16 KiB host page.  The guest interposer rounds every mappable blob
-    * CREATE to the same boundary.  Grow the actual host-visible Vulkan
-    * allocation here as well so vkr never exports an aperture larger than its
-    * backing allocation.  Imported resources already have fixed ownership and
-    * must preserve their advertised size. */
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info)
-      alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
-#endif
+   const bool native_metal_mapping =
+      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info &&
+      !might_export && physical_dev->is_dma_buf_emulated &&
+      physical_dev->EXT_metal_objects;
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info &&
+       !native_metal_mapping) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
        * dma_buf fd export support, we must use gbm bo import path instead of forcing
@@ -429,27 +425,13 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
          alloc_info->pNext = &local_import_info;
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
-      } else if (physical_dev->is_metal_export_supported) {
-         assert(physical_dev->is_dma_buf_emulated);
-         /* Align to 4KiB, which is what Linux expects */
-         alloc_info->allocationSize = align(alloc_info->allocationSize, 0x1000);
-         if (!export_info) {
-            local_export_info = (const VkExportMemoryAllocateInfo){
-               .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-               .pNext = alloc_info->pNext,
-               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
-            };
-            export_info = &local_export_info;
-            alloc_info->pNext = &local_export_info;
-         }
       }
    }
 
    if (export_info) {
       /* Linux fd exports are guest transport semantics. MoltenVK exposes the
        * corresponding ordinary allocation as an MTLHeap on macOS. */
-      if (physical_dev->is_dma_buf_emulated &&
-          physical_dev->is_metal_export_supported) {
+      if (physical_dev->is_dma_buf_emulated) {
          export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
          export_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
          export_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
@@ -460,6 +442,19 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
          valid_fd_types |= 1 << VIRGL_RESOURCE_METAL_HEAP;
+   }
+
+   const bool metal_buffer_exportable =
+      (might_export || native_metal_mapping) && physical_dev->EXT_metal_objects;
+   if (native_metal_mapping)
+      valid_fd_types |= 1 << VIRGL_RESOURCE_METAL_BUFFER;
+   if (metal_buffer_exportable) {
+      local_metal_buffer_export_info = (VkExportMetalObjectCreateInfoEXT){
+         .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+         .pNext = alloc_info->pNext,
+         .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT,
+      };
+      alloc_info->pNext = &local_metal_buffer_export_info;
    }
 
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
@@ -473,15 +468,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    mem->device = dev;
    mem->might_export = might_export;
+   mem->metal_buffer_exportable = metal_buffer_exportable;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
    mem->allocation_size = alloc_info->allocationSize;
 	mem->memory_type_index = mem_type_index;
-	list_inithead(&mem->bound_images);
+   list_inithead(&mem->bound_images);
    if (res_info)
-      mem->import_resource_id = res_info->resourceId;
+      mem->import_metal_state =
+         vkr_context_retain_metal_texture_state(ctx, res_info->resourceId);
 }
 
 static void
@@ -617,13 +614,18 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 static void *
 vkr_device_memory_export_metal_texture(struct vkr_device_memory *mem);
 
+static void *
+vkr_device_memory_export_metal_buffer(struct vkr_device_memory *mem);
+
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
 	list_for_each_entry_safe (struct vkr_image, img, &mem->bound_images, memory_head)
 		vkr_image_release(img);
-	if (mem->export_resource_id)
-		virgl_resource_set_metal_texture(mem->export_resource_id, NULL);
+	virgl_resource_metal_texture_state_release(mem->import_metal_state);
+	virgl_resource_metal_texture_state_release(mem->export_metal_state);
+	mem->import_metal_state = NULL;
+	mem->export_metal_state = NULL;
 	if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
@@ -634,13 +636,45 @@ void
 vkr_device_memory_publish_metal_texture(struct vkr_device_memory *mem)
 {
 #ifdef __APPLE__
-	if (!mem || !mem->export_resource_id)
+	if (!mem || (!mem->import_metal_state && !mem->export_metal_state))
 		return;
-	virgl_resource_set_metal_texture(mem->export_resource_id,
-	                                 vkr_device_memory_export_metal_texture(mem));
+	void *metal_texture = vkr_device_memory_export_metal_texture(mem);
+	virgl_resource_metal_texture_state_publish(
+		mem->import_metal_state, metal_texture);
+	if (mem->export_metal_state != mem->import_metal_state)
+		virgl_resource_metal_texture_state_publish(
+			mem->export_metal_state, metal_texture);
 #else
 	(void)mem;
 #endif
+}
+
+void
+vkr_device_memory_publish_metal_buffer(struct vkr_device_memory *mem)
+{
+	if (!mem || !mem->export_metal_state)
+		return;
+	virgl_resource_metal_buffer_state_publish(
+		mem->export_metal_state,
+		vkr_device_memory_export_metal_buffer(mem));
+}
+
+static void *
+vkr_device_memory_export_metal_buffer(struct vkr_device_memory *mem)
+{
+	if (!mem->device->export_metal_objects || !mem->metal_buffer_exportable)
+		return NULL;
+
+	VkExportMetalBufferInfoEXT buffer_info = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT,
+		.memory = mem->base.handle.device_memory,
+	};
+	VkExportMetalObjectsInfoEXT objects_info = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+		.pNext = &buffer_info,
+	};
+	mem->device->export_metal_objects(mem->device->base.handle.device, &objects_info);
+	return buffer_info.mtlBuffer;
 }
 
 static void *
@@ -650,13 +684,9 @@ vkr_device_memory_export_metal_texture(struct vkr_device_memory *mem)
 	if (!mem->device->export_metal_objects)
 		return NULL;
 
-	const VkExternalMemoryHandleTypeFlags guest_fd_types =
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 	struct vkr_image *candidate = NULL;
 	list_for_each_entry (struct vkr_image, img, &mem->bound_images, memory_head) {
-		if (img->memory_offset != 0 ||
-		    !(img->external_handle_types & guest_fd_types))
+		if (img->memory_offset != 0 || !img->metal_texture_exportable)
 			continue;
 		if (candidate) {
 			vkr_log("device memory has multiple external image bindings; refusing scanout export");
@@ -670,13 +700,16 @@ vkr_device_memory_export_metal_texture(struct vkr_device_memory *mem)
 	VkExportMetalTextureInfoEXT texture_info = {
 		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
 		.image = candidate->base.handle.image,
-		.plane = VK_IMAGE_ASPECT_COLOR_BIT,
+		.plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
 	};
 	VkExportMetalObjectsInfoEXT objects_info = {
 		.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
 		.pNext = &texture_info,
 	};
 	mem->device->export_metal_objects(mem->device->base.handle.device, &objects_info);
+	if (!texture_info.mtlTexture)
+		vkr_log("failed to export Metal texture for %ux%u", candidate->width,
+		        candidate->height);
 	return texture_info.mtlTexture;
 #else
 	return NULL;
@@ -698,7 +731,6 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       vkr_log("mem has been exported");
       return false;
    }
-
    uint32_t map_info = VIRGL_RENDERER_MAP_CACHE_NONE;
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
       const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
@@ -717,9 +749,11 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
    const bool can_export_metal = mem->valid_fd_types & (1 << VIRGL_RESOURCE_METAL_HEAP);
+   const bool can_export_metal_buffer =
+      mem->valid_fd_types & (1 << VIRGL_RESOURCE_METAL_BUFFER);
    enum virgl_resource_fd_type fd_type;
    VkExternalMemoryHandleTypeFlagBits handle_type;
-   struct virgl_resource_vulkan_info vulkan_info;
+   struct virgl_resource_vulkan_info vulkan_info = { 0 };
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
       if (!can_export_dma_buf) {
          vkr_log("mem cannot export to dma_buf for cross device blob sharing");
@@ -733,6 +767,9 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
        */
       fd_type = VIRGL_RESOURCE_METAL_HEAP;
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+   } else if (can_export_metal_buffer) {
+      fd_type = VIRGL_RESOURCE_METAL_BUFFER;
+      handle_type = 0;
    } else if (can_export_dma_buf) {
       /* prefer dmabuf for easier mapping? */
       fd_type = VIRGL_RESOURCE_FD_DMABUF;
@@ -760,6 +797,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
    int fd = -1;
    MTLResource_id metal_heap = NULL;
+   MTLResource_id metal_buffer = NULL;
    if (mem->udmabuf_fd >= 0) {
       fd = os_dupfd_cloexec(mem->udmabuf_fd);
       if (fd < 0) {
@@ -786,6 +824,12 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       VkResult ret = vk->GetMemoryMetalHandleEXT(mem->device->base.handle.device, &metal_info, &metal_heap);
       if (ret != VK_SUCCESS) {
          vkr_log("metal export failed (vk ret %d)", ret);
+         return false;
+      }
+   } else if (fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
+      metal_buffer = vkr_device_memory_export_metal_buffer(mem);
+      if (!metal_buffer) {
+         vkr_log("Metal buffer export failed");
          return false;
       }
    } else {
@@ -822,7 +866,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
 	if (fd_type == VIRGL_RESOURCE_METAL_HEAP) {
 		out_blob->u.metal_heap = metal_heap;
-		out_blob->metal_texture = vkr_device_memory_export_metal_texture(mem);
+	} else if (fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
+		out_blob->u.metal_buffer = metal_buffer;
 	} else {
       out_blob->u.fd = fd;
    }

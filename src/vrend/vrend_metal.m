@@ -179,6 +179,30 @@ bool virgl_metal_create_texture_from_heap(MTLHeap_id heap,
    return false;
 }
 
+bool virgl_metal_create_texture_from_buffer(
+   MTLBuffer_id buffer,
+   const struct vrend_metal_texture_description *desc,
+   MTLTexture_id *tex)
+{
+   id<MTLBuffer> mtl_buffer = (id<MTLBuffer>)buffer;
+   MTLTextureDescriptor *descriptor = new_descriptor(desc);
+   *tex = nil;
+   if (!mtl_buffer || !descriptor || !desc->stride) {
+      [descriptor release];
+      return false;
+   }
+
+   descriptor.resourceOptions =
+      (mtl_buffer.storageMode << MTLResourceStorageModeShift) |
+      (mtl_buffer.cpuCacheMode << MTLResourceCPUCacheModeShift) |
+      (mtl_buffer.hazardTrackingMode << MTLResourceHazardTrackingModeShift);
+   *tex = [mtl_buffer newTextureWithDescriptor:descriptor
+                                         offset:desc->offset
+                                    bytesPerRow:desc->stride];
+   [descriptor release];
+   return !!*tex;
+}
+
 uint64_t virgl_metal_heap_size(MTLHeap_id heap)
 {
    id<MTLHeap> mtl_heap = (id<MTLHeap>)heap;
@@ -186,9 +210,27 @@ uint64_t virgl_metal_heap_size(MTLHeap_id heap)
    return mtl_heap ? (uint64_t)mtl_heap.size : 0;
 }
 
+uint64_t virgl_metal_buffer_size(MTLBuffer_id buffer)
+{
+   id<MTLBuffer> mtl_buffer = (id<MTLBuffer>)buffer;
+   return mtl_buffer ? (uint64_t)mtl_buffer.length : 0;
+}
+
+void *virgl_metal_buffer_contents(MTLBuffer_id buffer)
+{
+   id<MTLBuffer> mtl_buffer = (id<MTLBuffer>)buffer;
+   return mtl_buffer ? mtl_buffer.contents : NULL;
+}
+
 void virgl_metal_release_texture(MTLTexture_id tex)
 {
    id<MTLTexture> mtl_texture = (id<MTLTexture>)tex;
 
    [mtl_texture release];
+}
+
+void virgl_metal_release_buffer(MTLBuffer_id buffer)
+{
+   id<MTLBuffer> mtl_buffer = (id<MTLBuffer>)buffer;
+   [mtl_buffer release];
 }

@@ -27,11 +27,23 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include "c11/threads.h"
 
 struct iovec;
 struct pipe_resource;
 struct virgl_context;
+
+/* In-process bridge between the Venus render thread that owns a VkImage and
+ * the virgl resource consumed by the window presenter.  Both sides own a
+ * reference, so image publication cannot race global resource creation or a
+ * reused numeric resource id. */
+struct virgl_resource_metal_texture_state {
+   atomic_uint refcount;
+   mtx_t mutex;
+   void *texture;
+   void *buffer;
+};
 
 enum virgl_resource_fd_type {
    VIRGL_RESOURCE_FD_DMABUF,
@@ -56,6 +68,9 @@ enum virgl_resource_fd_type {
     * be shared across CPU and GPU. It can be the backing storage for textures.
     */
    VIRGL_RESOURCE_METAL_HEAP,
+
+   /** A shared MTLBuffer used for ordinary host-visible Venus memory. */
+   VIRGL_RESOURCE_METAL_BUFFER,
 
    VIRGL_RESOURCE_FD_INVALID = -1,
 };
@@ -103,11 +118,11 @@ struct virgl_resource {
 
 	/* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
 	void *metal_heap;
-	/* Exact VkImage backing exported with VK_EXT_metal_objects. This is kept
-	 * separate from metal_heap because the heap remains the cross-context
-	 * memory transport while this texture is the displayable image identity. */
-	void *metal_texture;
-	mtx_t metal_texture_mutex;
+	/* When fd_type == VIRGL_RESOURCE_METAL_BUFFER */
+	void *metal_buffer;
+	/* Exact VkImage identity published by Venus. The heap remains only the
+	 * allocation transport; scanout never reconstructs a texture from it. */
+	struct virgl_resource_metal_texture_state *metal_texture_state;
 
    const struct iovec *iov;
    int iov_count;
@@ -177,8 +192,11 @@ struct virgl_resource *
 virgl_resource_create_from_metal_heap(struct virgl_context *ctx,
                                       uint32_t res_id,
                                       void *metal_heap,
-									  void *metal_texture,
+									  struct virgl_resource_metal_texture_state *texture_state,
                                       const struct virgl_resource_vulkan_info *vulkan_info);
+
+struct virgl_resource *
+virgl_resource_create_from_metal_buffer(uint32_t res_id, void *metal_buffer);
 
 void
 virgl_resource_remove(uint32_t res_id);
@@ -186,11 +204,32 @@ virgl_resource_remove(uint32_t res_id);
 struct virgl_resource *
 virgl_resource_lookup(uint32_t res_id);
 
-bool
-virgl_resource_set_metal_texture(uint32_t res_id, void *metal_texture);
+struct virgl_resource_metal_texture_state *
+virgl_resource_metal_texture_state_create(void);
+
+struct virgl_resource_metal_texture_state *
+virgl_resource_metal_texture_state_retain(
+   struct virgl_resource_metal_texture_state *state);
+
+void
+virgl_resource_metal_texture_state_release(
+   struct virgl_resource_metal_texture_state *state);
+
+void
+virgl_resource_metal_texture_state_publish(
+   struct virgl_resource_metal_texture_state *state,
+   void *metal_texture);
+
+void
+virgl_resource_metal_buffer_state_publish(
+   struct virgl_resource_metal_texture_state *state,
+   void *metal_buffer);
 
 void *
-virgl_resource_retain_metal_texture(struct virgl_resource *res);
+virgl_resource_retain_metal_texture(uint32_t res_id);
+
+void *
+virgl_resource_retain_metal_buffer(uint32_t res_id);
 
 int
 virgl_resource_attach_iov(struct virgl_resource *res,

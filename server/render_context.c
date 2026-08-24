@@ -89,12 +89,14 @@ render_context_dispatch_import_resource(struct render_context *ctx,
    const struct render_context_op_import_resource_request *req =
       &request->import_resource;
 
-   if (req->fd_type == VIRGL_RESOURCE_METAL_HEAP) {
+   if (req->fd_type == VIRGL_RESOURCE_METAL_HEAP ||
+       req->fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
       if (!ctx->in_process || fd_count != 0 || !req->res_ptr) {
-         render_log("invalid Metal heap import for resource %u", req->res_id);
+         render_log("invalid Metal resource import for resource %u", req->res_id);
          return false;
       }
-      return render_state_import_resource_metal(ctx->ctx_id, req->res_id, req->res_ptr,
+      return render_state_import_resource_metal(ctx->ctx_id, req->res_id,
+                                                req->fd_type, req->res_ptr,
                                                 req->size);
    }
 
@@ -120,7 +122,7 @@ render_context_dispatch_create_resource(struct render_context *ctx,
    int res_fd = -1;
    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
 										  req->blob_size, req->blob_flags, &reply.fd_type,
-										  &res_fd, &reply.res_ptr, &reply.texture_ptr,
+										  &res_fd, &reply.res_ptr, &reply.texture_state_ptr,
 										  &reply.map_info,
                                           &reply.vulkan_info);
    if (!ok)
@@ -137,7 +139,7 @@ render_context_dispatch_create_resource(struct render_context *ctx,
          render_state_destroy_resource(ctx->ctx_id, req->res_id);
 		 reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
 		 reply.res_ptr = NULL;
-		 reply.texture_ptr = NULL;
+		 reply.texture_state_ptr = NULL;
       }
       ok = render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
    }

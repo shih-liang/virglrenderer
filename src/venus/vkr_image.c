@@ -36,9 +36,10 @@ vkr_image_release(struct vkr_image *img)
 	vkr_device_memory_publish_metal_texture(mem);
 }
 
-static void
+static bool
 vkr_image_fix_create_info(struct vkr_device *dev,
-                          VkImageCreateInfo *pCreateInfo)
+                          VkImageCreateInfo *pCreateInfo,
+                          VkExportMetalObjectCreateInfoEXT *metal_export_info)
 {
    VkExternalMemoryImageCreateInfo *ext_create_info;
 
@@ -50,53 +51,114 @@ vkr_image_fix_create_info(struct vkr_device *dev,
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
       const VkExternalMemoryHandleTypeFlags guest_types =
          ext_create_info->handleTypes;
-      if (dev->physical_device->is_metal_export_supported &&
-          (guest_types & fd_types)) {
+      if (guest_types & fd_types) {
          /* Linux fd handle types are guest transport semantics. MoltenVK uses
           * an MTLHeap for the corresponding ordinary external allocation. */
          ext_create_info->handleTypes &= ~fd_types;
          ext_create_info->handleTypes |=
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+
+         if (dev->physical_device->EXT_metal_objects && metal_export_info) {
+            *metal_export_info = (VkExportMetalObjectCreateInfoEXT){
+               .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+               .pNext = pCreateInfo->pNext,
+               .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+            };
+            pCreateInfo->pNext = metal_export_info;
+            return true;
+         }
       }
    }
+
+   return false;
 }
 
 static VkResult
-vkr_image_fix_drm_format(struct vkr_device *dev,
-                         VkImageCreateInfo *pCreateInfo)
+vkr_image_fix_drm_format(UNUSED struct vkr_device *dev,
+                         VkImageCreateInfo *pCreateInfo,
+                         uint64_t *selected_modifier)
 {
-   const VkImageDrmFormatModifierExplicitCreateInfoEXT* drm_format_info =
-            vkr_find_struct(pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
-   const VkImageDrmFormatModifierListCreateInfoEXT* drm_format_list =
-            vkr_find_struct(pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *drm_format_info =
+      vkr_find_struct(pCreateInfo,
+         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   VkImageDrmFormatModifierListCreateInfoEXT *drm_format_list =
+      vkr_find_struct(pCreateInfo,
+         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
 
    if (pCreateInfo->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || (!drm_format_info && !drm_format_list)) {
       return VK_SUCCESS;
    }
 
-   if (drm_format_info && drm_format_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
-      pCreateInfo->tiling = VK_IMAGE_TILING_LINEAR;
-      return VK_SUCCESS;
-   }
-
-   for (int i = 0; drm_format_list && i < drm_format_list->drmFormatModifierCount; i++) {
-      if (drm_format_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR) {
-         pCreateInfo->tiling = VK_IMAGE_TILING_LINEAR;
-         return VK_SUCCESS;
+   uint64_t modifier = UINT64_MAX;
+   if (drm_format_info) {
+      modifier = drm_format_info->drmFormatModifier;
+   } else {
+      /* Prefer the native GPU layout when Mesa offers both advertised paths. */
+      for (uint32_t i = 0; i < drm_format_list->drmFormatModifierCount; i++) {
+         if (drm_format_list->pDrmFormatModifiers[i] ==
+                DRM_FORMAT_MOD_APPLE_GPU_TILED &&
+             (pCreateInfo->format == VK_FORMAT_B8G8R8A8_UNORM ||
+              pCreateInfo->format == VK_FORMAT_B8G8R8A8_SRGB)) {
+            modifier = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+            break;
+         }
+         if (drm_format_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR)
+            modifier = DRM_FORMAT_MOD_LINEAR;
       }
    }
 
-   vkr_log("only DRM_FORMAT_MOD_LINEAR is supported");
-   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (modifier != DRM_FORMAT_MOD_LINEAR &&
+       modifier != DRM_FORMAT_MOD_APPLE_GPU_TILED) {
+      vkr_log("unsupported emulated DRM format modifier 0x%" PRIx64, modifier);
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+   if (modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED &&
+       ((pCreateInfo->format != VK_FORMAT_B8G8R8A8_UNORM &&
+         pCreateInfo->format != VK_FORMAT_B8G8R8A8_SRGB) ||
+        pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
+        pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 ||
+        pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   VkBaseInStructure *prev = vkr_find_prev_struct(
+      pCreateInfo,
+      drm_format_info
+         ? VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT
+         : VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+   assert(prev);
+   prev->pNext = prev->pNext->pNext;
+
+   pCreateInfo->tiling = modifier == DRM_FORMAT_MOD_LINEAR
+                           ? VK_IMAGE_TILING_LINEAR
+                           : VK_IMAGE_TILING_OPTIMAL;
+   *selected_modifier = modifier;
+   return VK_SUCCESS;
 }
 
 static VkResult
 vkr_image_emulate_drm_format_modifier_properties(UNUSED struct vkr_device *dev,
-                                                 UNUSED VkImage image,
+                                                 const struct vkr_image *img,
                                                  VkImageDrmFormatModifierPropertiesEXT* pProperties)
 {
-   pProperties->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+   if (!img || !img->drm_format_modifier_emulated)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   pProperties->drmFormatModifier = img->drm_format_modifier;
    return VK_SUCCESS;
+}
+
+static void
+vkr_image_get_apple_tiled_layout(uint32_t width,
+                                 uint32_t height,
+                                 VkSubresourceLayout *layout)
+{
+   const VkDeviceSize row_pitch = (VkDeviceSize)width * 4;
+   *layout = (VkSubresourceLayout){
+      .offset = 0,
+      .size = row_pitch * height,
+      .rowPitch = row_pitch,
+      .arrayPitch = row_pitch * height,
+      .depthPitch = row_pitch * height,
+   };
 }
 
 static void
@@ -109,19 +171,24 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    const bool drm_format_modifier_emulated =
       !dev->physical_device->EXT_image_drm_format_modifier &&
       create_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   uint64_t drm_format_modifier = UINT64_MAX;
 
    const VkExternalMemoryImageCreateInfo *guest_external_info =
       vkr_find_struct(create_info->pNext,
                       VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    const VkExternalMemoryHandleTypeFlags guest_external_handle_types =
       guest_external_info ? guest_external_info->handleTypes : 0;
+   VkExportMetalObjectCreateInfoEXT metal_export_info = { 0 };
+   bool metal_texture_exportable = false;
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
-      vkr_image_fix_create_info(dev, create_info);
+      metal_texture_exportable =
+         vkr_image_fix_create_info(dev, create_info, &metal_export_info);
    }
 
    if (!dev->physical_device->EXT_image_drm_format_modifier) {
-      args->ret = vkr_image_fix_drm_format(dev, create_info);
+      args->ret = vkr_image_fix_drm_format(dev, create_info,
+                                           &drm_format_modifier);
       if (args->ret != VK_SUCCESS) {
          return;
       }
@@ -156,7 +223,9 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
       img->format = args->pCreateInfo->format;
       img->usage = args->pCreateInfo->usage;
       img->external_handle_types = guest_external_handle_types;
+      img->metal_texture_exportable = metal_texture_exportable;
       img->drm_format_modifier_emulated = drm_format_modifier_emulated;
+      img->drm_format_modifier = drm_format_modifier;
    }
 }
 
@@ -222,7 +291,7 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
 	struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -239,7 +308,7 @@ vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkBindImageMemory2 *args)
 {
 	struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -282,6 +351,12 @@ vkr_dispatch_vkGetImageSubresourceLayout(
    struct vn_device_proc_table *vk = &dev->proc_table;
    const struct vkr_image *img = vkr_image_from_handle(args->image);
 
+   if (img && img->drm_format_modifier_emulated &&
+       img->drm_format_modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED) {
+      vkr_image_get_apple_tiled_layout(img->width, img->height, args->pLayout);
+      return;
+   }
+
    if (img && img->drm_format_modifier_emulated) {
       VkImageSubresource *subresource = (VkImageSubresource *)args->pSubresource;
       if (subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
@@ -302,6 +377,13 @@ vkr_dispatch_vkGetImageSubresourceLayout2(
    struct vn_device_proc_table *vk = &dev->proc_table;
    const struct vkr_image *img = vkr_image_from_handle(args->image);
 
+   if (img && img->drm_format_modifier_emulated &&
+       img->drm_format_modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED) {
+      vkr_image_get_apple_tiled_layout(
+         img->width, img->height, &args->pLayout->subresourceLayout);
+      return;
+   }
+
    if (img && img->drm_format_modifier_emulated) {
       VkImageSubresource2 *subresource = (VkImageSubresource2 *)args->pSubresource;
       if (subresource->imageSubresource.aspectMask ==
@@ -321,11 +403,29 @@ vkr_dispatch_vkGetDeviceImageSubresourceLayout(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   VkExportMetalObjectCreateInfoEXT metal_export_info = { 0 };
+   uint64_t drm_format_modifier = UINT64_MAX;
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
       vkr_image_fix_create_info(dev,
-                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo,
+                                &metal_export_info);
+   }
+
+   if (!dev->physical_device->EXT_image_drm_format_modifier) {
+      VkImageCreateInfo *create_info = (VkImageCreateInfo *)args->pInfo->pCreateInfo;
+      if (create_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+         if (vkr_image_fix_drm_format(dev, create_info,
+                                      &drm_format_modifier) != VK_SUCCESS)
+            return;
+         if (drm_format_modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED) {
+            vkr_image_get_apple_tiled_layout(
+               create_info->extent.width, create_info->extent.height,
+               &args->pLayout->subresourceLayout);
+            return;
+         }
+      }
    }
 
    if (!dev->physical_device->EXT_image_drm_format_modifier &&
@@ -348,6 +448,7 @@ vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   const struct vkr_image *img = vkr_image_from_handle(args->image);
 
    vn_replace_vkGetImageDrmFormatModifierPropertiesEXT_args_handle(args);
 
@@ -355,7 +456,7 @@ vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
       args->ret = vk->GetImageDrmFormatModifierPropertiesEXT(args->device, args->image,
                                                             args->pProperties);
    } else {
-      args->ret = vkr_image_emulate_drm_format_modifier_properties(dev, args->image,
+      args->ret = vkr_image_emulate_drm_format_modifier_properties(dev, img,
                                                                    args->pProperties);
    }
 }
@@ -411,11 +512,13 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   VkExportMetalObjectCreateInfoEXT metal_export_info = { 0 };
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
       vkr_image_fix_create_info(dev,
-                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo,
+                                &metal_export_info);
    }
 
    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
@@ -430,11 +533,13 @@ vkr_dispatch_vkGetDeviceImageSparseMemoryRequirements(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+   VkExportMetalObjectCreateInfoEXT metal_export_info = { 0 };
 
    /* if host does not natively support dmabuf we need to patch create info */
    if (dev->physical_device->is_dma_buf_emulated) {
       vkr_image_fix_create_info(dev,
-                                (VkImageCreateInfo *)args->pInfo->pCreateInfo);
+                                (VkImageCreateInfo *)args->pInfo->pCreateInfo,
+                                &metal_export_info);
    }
 
    vn_replace_vkGetDeviceImageSparseMemoryRequirements_args_handle(args);

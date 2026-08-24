@@ -15,13 +15,14 @@
 
 #include "vkr_cs.h"
 
+struct vkr_device_memory;
+
 /*
  * When vkr_context_create_resource or vkr_context_import_resource is called, a
  * vkr_resource is created, and is valid until vkr_context_destroy_resource.
  */
 struct vkr_resource {
    uint32_t res_id;
-
    enum virgl_resource_fd_type fd_type;
 
    union {
@@ -31,7 +32,12 @@ struct vkr_resource {
       uint8_t *data;
       /* valid when fd_type is metal heap */
       MTLResource_id metal_heap;
+      /* valid when fd_type is metal buffer */
+      MTLResource_id metal_buffer;
    } u;
+
+   /* Shared with the global virgl resource for exact VkImage publication. */
+   struct virgl_resource_metal_texture_state *metal_texture_state;
 
    size_t size;
 };
@@ -148,7 +154,7 @@ vkr_context_import_resource_metal(struct vkr_context *ctx,
                                   uint32_t res_id,
                                   uint64_t blob_size,
                                   enum virgl_resource_fd_type fd_type,
-                                  void *metal_heap);
+                                  void *metal_resource);
 
 void
 vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id);
@@ -161,6 +167,20 @@ vkr_context_get_resource(struct vkr_context *ctx, uint32_t res_id)
    mtx_unlock(&ctx->resource_mutex);
 
    return likely(entry) ? entry->data : NULL;
+}
+
+static inline struct virgl_resource_metal_texture_state *
+vkr_context_retain_metal_texture_state(struct vkr_context *ctx, uint32_t res_id)
+{
+   mtx_lock(&ctx->resource_mutex);
+   const struct hash_entry *entry = _mesa_hash_table_search(ctx->resource_table, &res_id);
+   struct vkr_resource *res = entry ? entry->data : NULL;
+   struct virgl_resource_metal_texture_state *state =
+      res && res->fd_type == VIRGL_RESOURCE_METAL_HEAP
+         ? virgl_resource_metal_texture_state_retain(res->metal_texture_state)
+         : NULL;
+   mtx_unlock(&ctx->resource_mutex);
+   return state;
 }
 
 static inline void

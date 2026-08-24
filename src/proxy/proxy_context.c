@@ -368,10 +368,14 @@ proxy_context_get_blob(struct virgl_context *base,
       return -1;
    }
 
-   if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP) {
+   if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP ||
+       reply.fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
       blob->type = reply.fd_type;
-		blob->u.metal_heap = reply.res_ptr;
-		blob->metal_texture = reply.texture_ptr;
+		if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP)
+			blob->u.metal_heap = reply.res_ptr;
+		else
+			blob->u.metal_buffer = reply.res_ptr;
+		blob->metal_texture_state = reply.texture_state_ptr;
       blob->map_info = reply.map_info;
       blob->vulkan_info = reply.vulkan_info;
 
@@ -468,7 +472,8 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    if (res->fd_type != VIRGL_RESOURCE_FD_INVALID &&
        res->fd_type != VIRGL_RESOURCE_FD_DMABUF &&
        res->fd_type != VIRGL_RESOURCE_FD_SHM &&
-       (res->fd_type != VIRGL_RESOURCE_METAL_HEAP ||
+       ((res->fd_type != VIRGL_RESOURCE_METAL_HEAP &&
+         res->fd_type != VIRGL_RESOURCE_METAL_BUFFER) ||
         (proxy_renderer.flags & VIRGL_RENDERER_RENDER_SERVER))) {
       proxy_log("failed to attach res %d with fd_type %d", res_id, res->fd_type);
       return;
@@ -504,9 +509,13 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .res_id = res_id,
       .fd_type = res_fd_type,
       .size = res_size,
-      .res_ptr = res_fd_type == VIRGL_RESOURCE_METAL_HEAP ? res->metal_heap : NULL,
+      .res_ptr = res_fd_type == VIRGL_RESOURCE_METAL_HEAP
+                    ? res->metal_heap
+                    : (res_fd_type == VIRGL_RESOURCE_METAL_BUFFER
+                          ? res->metal_buffer : NULL),
    };
-   const bool sent = res_fd_type == VIRGL_RESOURCE_METAL_HEAP
+   const bool sent = (res_fd_type == VIRGL_RESOURCE_METAL_HEAP ||
+                      res_fd_type == VIRGL_RESOURCE_METAL_BUFFER)
                         ? proxy_socket_send_request(&ctx->socket, &req, sizeof(req))
                         : proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
                                                              &res_fd, 1);

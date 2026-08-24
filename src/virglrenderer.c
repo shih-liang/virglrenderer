@@ -1226,8 +1226,13 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
          return -ENOMEM;
    } else if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
 		res = virgl_resource_create_from_metal_heap(ctx, args->res_handle,
-											 blob.u.metal_heap, blob.metal_texture,
-											 &blob.vulkan_info);
+										 blob.u.metal_heap, blob.metal_texture_state,
+										 &blob.vulkan_info);
+      if (!res)
+         return -ENOMEM;
+   } else if (blob.type == VIRGL_RESOURCE_METAL_BUFFER) {
+      res = virgl_resource_create_from_metal_buffer(args->res_handle,
+                                                    blob.u.metal_buffer);
       if (!res)
          return -ENOMEM;
    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
@@ -1297,6 +1302,11 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
       case VIRGL_RESOURCE_METAL_HEAP:
          ret = vkr_allocator_resource_map(res, &map, &map_size);
          break;
+      case VIRGL_RESOURCE_METAL_BUFFER:
+         map_size = virgl_metal_buffer_size(res->metal_buffer);
+         map = map_size >= res->map_size
+                  ? virgl_metal_buffer_contents(res->metal_buffer) : NULL;
+         break;
       case VIRGL_RESOURCE_OPAQUE_HANDLE:
          map = ctx->resource_map(ctx, res, NULL, PROT_WRITE | PROT_READ, MAP_SHARED);
          map_size = res->map_size;
@@ -1356,6 +1366,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
+      case VIRGL_RESOURCE_METAL_BUFFER:
       case VIRGL_RESOURCE_FD_INVALID:
          /* Avoid a default case so that -Wswitch will tell us at compile time
           * if a new virgl resource type is added without being handled here.
@@ -1396,6 +1407,9 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
          ret = vkr_allocator_resource_unmap(res);
+         break;
+      case VIRGL_RESOURCE_METAL_BUFFER:
+         ret = 0;
          break;
       case VIRGL_RESOURCE_FD_INVALID:
          /* Avoid a default case so that -Wswitch will tell us at compile time
@@ -1446,6 +1460,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
       break;
    case VIRGL_RESOURCE_OPAQUE_HANDLE:
    case VIRGL_RESOURCE_METAL_HEAP:
+   case VIRGL_RESOURCE_METAL_BUFFER:
    case VIRGL_RESOURCE_FD_INVALID:
       /* Avoid a default case so that -Wswitch will tell us at compile time if a
        * new virgl resource type is added without being handled here.
@@ -1525,14 +1540,6 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
 {
    TRACE_FUNC();
 #ifdef ENABLE_METAL
-   struct virgl_resource *res = virgl_resource_lookup(res_id);
-
-   if (!res)
-      return VIRGL_NATIVE_HANDLE_NONE;
-
-   if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP)
-      return VIRGL_NATIVE_HANDLE_NONE;
-
    struct vrend_metal_texture_description desc = {
       .width = width,
       .height = height,
@@ -1542,14 +1549,23 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
       .format = virgl_format,
    };
    MTLTexture_id tex;
-	MTLTexture_id source = virgl_resource_retain_metal_texture(res);
+	MTLTexture_id source = virgl_resource_retain_metal_texture(res_id);
 
-	/* Scanout must use the exact texture exported from the VkImage. Recreating a
-	 * texture from the allocation heap loses the image's layout and identity. */
-	if (!source)
-		return VIRGL_NATIVE_HANDLE_NONE;
-	const bool valid = virgl_metal_retain_texture(source, &desc, &tex);
-	virgl_metal_release_texture(source);
+	/* Prefer an exact optimal VkImage texture. Mesa WSI can instead export a
+	 * linear buffer resource after copying from its render image; in that case
+	 * create a zero-copy texture view over the exact exported MTLBuffer. Never
+	 * reconstruct storage from a heap and guessed offset. */
+	bool valid = false;
+	if (source) {
+		valid = virgl_metal_retain_texture(source, &desc, &tex);
+		virgl_metal_release_texture(source);
+	} else {
+		MTLBuffer_id buffer = virgl_resource_retain_metal_buffer(res_id);
+		if (buffer) {
+			valid = virgl_metal_create_texture_from_buffer(buffer, &desc, &tex);
+			virgl_metal_release_buffer(buffer);
+		}
+	}
 	if (!valid)
 		return VIRGL_NATIVE_HANDLE_NONE;
 

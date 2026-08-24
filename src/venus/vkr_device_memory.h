@@ -16,6 +16,7 @@ struct vkr_device_memory {
    struct vkr_device *device;
 
    bool might_export;
+   bool metal_buffer_exportable;
 
    uint32_t property_flags;
    uint32_t valid_fd_types;
@@ -29,14 +30,13 @@ struct vkr_device_memory {
    uint64_t allocation_size;
    uint32_t memory_type_index;
 
-   /* Set when memory is imported via VkImportMemoryResourceInfoMESA. */
-   uint32_t import_resource_id;
-
 	bool exported;
-	/* Global virgl resource created from this allocation. The resource can be
-	 * created before or after VkBindImageMemory, so texture publication must
-	 * support both orderings. */
-	uint32_t export_resource_id;
+	/* Shared states, rather than numeric resource ids, connect bound images to
+	 * scanout without creation-order or id-reuse races. Import and export stay
+	 * distinct because Vulkan permits compatible external memory to be
+	 * re-exported as a different resource. */
+	struct virgl_resource_metal_texture_state *import_metal_state;
+	struct virgl_resource_metal_texture_state *export_metal_state;
 
 	/* Images actually bound to this allocation. An exported Metal texture is
 	 * available only when this list identifies one unambiguous external image. */
@@ -52,6 +52,9 @@ vkr_device_memory_release(struct vkr_device_memory *mem);
 
 void
 vkr_device_memory_publish_metal_texture(struct vkr_device_memory *mem);
+
+void
+vkr_device_memory_publish_metal_buffer(struct vkr_device_memory *mem);
 
 bool
 vkr_device_memory_export_blob(struct vkr_device_memory *mem,
