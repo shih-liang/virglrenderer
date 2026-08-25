@@ -84,6 +84,99 @@ struct global_state {
 
 static struct global_state state;
 
+/* The public resource table is process-global, while attached resource
+ * handles are context-local. Track the exact (context, table resource) pairs
+ * so unref of VM A cannot detach VM B's resource with the same local handle. */
+struct virgl_resource_attachment {
+   uint32_t ctx_id;
+   uint32_t resource_table_id;
+   struct virgl_resource_attachment *next;
+};
+
+static struct virgl_resource_attachment *resource_attachments;
+
+static bool
+resource_attachment_add(uint32_t ctx_id, uint32_t resource_table_id)
+{
+   for (struct virgl_resource_attachment *item = resource_attachments;
+        item; item = item->next) {
+      if (item->ctx_id == ctx_id && item->resource_table_id == resource_table_id)
+         return true;
+   }
+
+   struct virgl_resource_attachment *item = malloc(sizeof(*item));
+   if (!item)
+      return false;
+   item->ctx_id = ctx_id;
+   item->resource_table_id = resource_table_id;
+   item->next = resource_attachments;
+   resource_attachments = item;
+   return true;
+}
+
+static void
+resource_attachment_remove(uint32_t ctx_id, uint32_t resource_table_id)
+{
+   struct virgl_resource_attachment **slot = &resource_attachments;
+   while (*slot) {
+      if ((*slot)->ctx_id == ctx_id &&
+          (*slot)->resource_table_id == resource_table_id) {
+         struct virgl_resource_attachment *item = *slot;
+         *slot = item->next;
+         free(item);
+         return;
+      }
+      slot = &(*slot)->next;
+   }
+}
+
+static void
+resource_attachment_detach_context(uint32_t ctx_id)
+{
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+   struct virgl_resource_attachment **slot = &resource_attachments;
+   while (*slot) {
+      if ((*slot)->ctx_id != ctx_id) {
+         slot = &(*slot)->next;
+         continue;
+      }
+      struct virgl_resource_attachment *item = *slot;
+      struct virgl_resource *res = virgl_resource_lookup(item->resource_table_id);
+      if (ctx && res)
+         ctx->detach_resource(ctx, res);
+      *slot = item->next;
+      free(item);
+   }
+}
+
+static void
+resource_attachment_detach_resource(struct virgl_resource *res)
+{
+   struct virgl_resource_attachment **slot = &resource_attachments;
+   while (*slot) {
+      if ((*slot)->resource_table_id != res->table_id) {
+         slot = &(*slot)->next;
+         continue;
+      }
+      struct virgl_resource_attachment *item = *slot;
+      struct virgl_context *ctx = virgl_context_lookup(item->ctx_id);
+      if (ctx)
+         ctx->detach_resource(ctx, res);
+      *slot = item->next;
+      free(item);
+   }
+}
+
+static void
+resource_attachment_clear(void)
+{
+   while (resource_attachments) {
+      struct virgl_resource_attachment *item = resource_attachments;
+      resource_attachments = item->next;
+      free(item);
+   }
+}
+
 /* new API - just wrap internal API for now */
 
 static int virgl_renderer_resource_create_internal(struct virgl_renderer_resource_create_args *args,
@@ -161,26 +254,26 @@ void *virgl_renderer_resource_get_priv(uint32_t res_handle)
    return res->private_data;
 }
 
-static bool detach_resource(struct virgl_context *ctx, void *data)
-{
-   struct virgl_resource *res = data;
-   ctx->detach_resource(ctx, res);
-   return true;
-}
-
 void virgl_renderer_resource_unref(uint32_t res_handle)
 {
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   struct virgl_context_foreach_args args;
 
    if (!res)
       return;
 
-   args.callback = detach_resource;
-   args.data = res;
-   virgl_context_foreach(&args);
+   resource_attachment_detach_resource(res);
+   virgl_resource_remove(res->table_id);
+}
 
-   virgl_resource_remove(res->res_id);
+int virgl_renderer_resource_set_context_id(uint32_t res_handle,
+                                           uint32_t context_res_id)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !context_res_id)
+      return -EINVAL;
+
+   virgl_resource_set_context_id(res, context_res_id);
+   return 0;
 }
 
 void virgl_renderer_fill_caps(uint32_t set, uint32_t version,
@@ -291,6 +384,7 @@ int virgl_renderer_context_create(uint32_t handle, uint32_t nlen, const char *na
 void virgl_renderer_context_destroy(uint32_t handle)
 {
    TRACE_FUNC();
+   resource_attachment_detach_context(handle);
    virgl_context_remove(handle);
 }
 
@@ -476,6 +570,8 @@ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
    if (!ctx || !res)
       return;
    ctx->attach_resource(ctx, res);
+   if (!resource_attachment_add(ctx->ctx_id, res->table_id))
+      ctx->detach_resource(ctx, res);
 }
 
 void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
@@ -486,6 +582,7 @@ void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
    if (!ctx || !res)
       return;
    ctx->detach_resource(ctx, res);
+   resource_attachment_remove(ctx->ctx_id, res->table_id);
 }
 
 static int virgl_renderer_resource_get_info_common(int res_handle,
@@ -786,6 +883,8 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    if (state.vrend_initialized)
       vrend_renderer_prepare_reset();
 
+   resource_attachment_clear();
+
    if (state.context_initialized)
       virgl_context_table_cleanup();
 
@@ -1011,6 +1110,8 @@ void virgl_renderer_reset(void)
    if (state.vrend_initialized)
       vrend_renderer_prepare_reset();
 
+   resource_attachment_clear();
+
    if (state.context_initialized)
       virgl_context_table_reset();
 
@@ -1154,7 +1255,10 @@ int virgl_renderer_execute(void *execute_args, uint32_t execute_size)
    }
 }
 
-int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_create_blob_args *args)
+static int
+virgl_renderer_resource_create_blob_internal(
+   const struct virgl_renderer_resource_create_blob_args *args,
+   uint32_t context_res_id)
 {
    TRACE_FUNC();
    struct virgl_resource *res;
@@ -1182,7 +1286,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    }
 
    /* user resource id must be greater than 0 */
-   if (args->res_handle == 0)
+   if (args->res_handle == 0 || context_res_id == 0)
       return -EINVAL;
 
    /* user resource id must be unique */
@@ -1207,6 +1311,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       if (!res)
          return -ENOMEM;
 
+      virgl_resource_set_context_id(res, context_res_id);
       res->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
       return 0;
    }
@@ -1215,7 +1320,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    if (!ctx)
       return -EINVAL;
 
-   ret = ctx->get_blob(ctx, args->res_handle, args->blob_id, args->size, args->blob_flags, &blob);
+   ret = ctx->get_blob(ctx, context_res_id, args->blob_id, args->size,
+                       args->blob_flags, &blob);
    if (ret)
       return ret;
 
@@ -1253,10 +1359,32 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
          return -ENOMEM;
    }
 
+   virgl_resource_set_context_id(res, context_res_id);
    res->map_info = blob.map_info;
    res->map_size = args->size;
 
+   /* get_blob creates the resource inside the renderer context and therefore
+    * has the same lifetime as an explicit CTX_ATTACH_RESOURCE. */
+   if (!resource_attachment_add(ctx->ctx_id, res->table_id)) {
+      ctx->detach_resource(ctx, res);
+      virgl_resource_remove(res->table_id);
+      return -ENOMEM;
+   }
+
    return 0;
+}
+
+int virgl_renderer_resource_create_blob(
+   const struct virgl_renderer_resource_create_blob_args *args)
+{
+   return virgl_renderer_resource_create_blob_internal(args, args->res_handle);
+}
+
+int virgl_renderer_resource_create_blob_with_context_id(
+   const struct virgl_renderer_resource_create_blob_args *args,
+   uint32_t context_res_id)
+{
+   return virgl_renderer_resource_create_blob_internal(args, context_res_id);
 }
 
 int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
@@ -1549,7 +1677,12 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
       .format = virgl_format,
    };
    MTLTexture_id tex;
-	MTLTexture_id source = virgl_resource_retain_metal_texture(res_id);
+	MTLTexture_id source = NULL;
+	struct virgl_resource *res = virgl_resource_lookup(res_id);
+	if (res && res->pipe_resource)
+		source = vrend_renderer_resource_metal_texture(res->pipe_resource);
+	if (!source)
+		source = virgl_resource_retain_metal_texture(res_id);
 
 	/* Prefer an exact optimal VkImage texture. Mesa WSI can instead export a
 	 * linear buffer resource after copying from its render image; in that case
@@ -1558,7 +1691,10 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
 	bool valid = false;
 	if (source) {
 		valid = virgl_metal_retain_texture(source, &desc, &tex);
-		virgl_metal_release_texture(source);
+		/* A Venus texture state returns a retained object.  A classic VirGL
+		 * pipe_resource owns its texture and remains alive for this call. */
+		if (!res || !res->pipe_resource)
+			virgl_metal_release_texture(source);
 	} else {
 		MTLBuffer_id buffer = virgl_resource_retain_metal_buffer(res_id);
 		if (buffer) {

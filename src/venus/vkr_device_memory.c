@@ -298,7 +298,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
    VkImportMemoryMetalHandleInfoEXT local_metal_import_info = { 0 };
    VkImportMemoryHostPointerInfoEXT local_host_import_info = { 0 };
-   VkExportMetalObjectCreateInfoEXT local_metal_buffer_export_info = { 0 };
    VkImportMemoryResourceInfoMESA *res_info = NULL;
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
@@ -342,16 +341,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
-   const bool native_metal_mapping =
-      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info &&
-      !might_export && physical_dev->is_dma_buf_emulated &&
-      physical_dev->EXT_metal_objects;
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info &&
-       !native_metal_mapping) {
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
        * dma_buf fd export support, we must use gbm bo import path instead of forcing
@@ -425,6 +419,20 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
          alloc_info->pNext = &local_import_info;
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+      } else if (physical_dev->is_dma_buf_emulated) {
+         /* Keep ordinary host-visible allocations on the established MTLHeap
+          * path.  A transport blob may be rounded to the host page later; an
+          * exact MTLBuffer would expose only the guest's original 4 KiB. */
+         alloc_info->allocationSize = align(alloc_info->allocationSize, 0x1000);
+         if (!export_info) {
+            local_export_info = (const VkExportMemoryAllocateInfo){
+               .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+               .pNext = alloc_info->pNext,
+               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+            };
+            export_info = &local_export_info;
+            alloc_info->pNext = &local_export_info;
+         }
       }
    }
 
@@ -444,19 +452,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          valid_fd_types |= 1 << VIRGL_RESOURCE_METAL_HEAP;
    }
 
-   const bool metal_buffer_exportable =
-      (might_export || native_metal_mapping) && physical_dev->EXT_metal_objects;
-   if (native_metal_mapping)
-      valid_fd_types |= 1 << VIRGL_RESOURCE_METAL_BUFFER;
-   if (metal_buffer_exportable) {
-      local_metal_buffer_export_info = (VkExportMetalObjectCreateInfoEXT){
-         .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
-         .pNext = alloc_info->pNext,
-         .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT,
-      };
-      alloc_info->pNext = &local_metal_buffer_export_info;
-   }
-
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
       if (local_import_info.fd >= 0)
@@ -468,7 +463,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    mem->device = dev;
    mem->might_export = might_export;
-   mem->metal_buffer_exportable = metal_buffer_exportable;
+   mem->metal_buffer_exportable = false;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;

@@ -8727,7 +8727,7 @@ static void vrend_resource_metal_init(UNUSED struct vrend_resource *gr, UNUSED u
 
 fail:
    if (tex)
-      virgl_metal_release_texture(gr->metal_texture);
+      virgl_metal_release_texture(tex);
    gr->metal_texture = NULL;
 #endif
 }
