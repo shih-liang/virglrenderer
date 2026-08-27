@@ -280,8 +280,6 @@ typedef void (*virgl_log_callback_type) (enum virgl_log_level_flags log_level,
 VIRGL_EXPORT int virgl_renderer_resource_create(struct virgl_renderer_resource_create_args *args, struct iovec *iov, uint32_t num_iovs);
 VIRGL_EXPORT int virgl_renderer_resource_import_eglimage(struct virgl_renderer_resource_create_args *args, void *image);
 VIRGL_EXPORT void virgl_renderer_resource_unref(uint32_t res_handle);
-VIRGL_EXPORT int virgl_renderer_resource_set_context_id(uint32_t res_handle,
-                                                        uint32_t context_res_id);
 
 VIRGL_EXPORT void virgl_renderer_resource_set_priv(uint32_t res_handle, void *priv);
 VIRGL_EXPORT void *virgl_renderer_resource_get_priv(uint32_t res_handle);
@@ -444,13 +442,6 @@ struct virgl_renderer_resource_create_blob_args
 
 VIRGL_EXPORT int
 virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_create_blob_args *args);
-
-/* NativePipe keeps the process-wide resource table handle distinct from the
- * resource id encoded in a guest context's command stream. */
-VIRGL_EXPORT int
-virgl_renderer_resource_create_blob_with_context_id(
-   const struct virgl_renderer_resource_create_blob_args *args,
-   uint32_t context_res_id);
 
 VIRGL_EXPORT int virgl_renderer_resource_map(uint32_t res_handle, void **map, uint64_t *out_size);
 

@@ -45,6 +45,7 @@
 
 static struct util_hash_table *virgl_resource_table;
 static struct virgl_resource_pipe_callbacks pipe_callbacks;
+static mtx_t virgl_resource_table_mutex;
 
 static void
 virgl_resource_destroy_func(void *val)
@@ -69,11 +70,16 @@ virgl_resource_destroy_func(void *val)
 int
 virgl_resource_table_init(const struct virgl_resource_pipe_callbacks *callbacks)
 {
+   if (mtx_init(&virgl_resource_table_mutex, mtx_plain) != thrd_success)
+      return ENOMEM;
+
    virgl_resource_table = util_hash_table_create(hash_func_u32,
                                                  equal_func,
                                                  virgl_resource_destroy_func);
-   if (!virgl_resource_table)
+   if (!virgl_resource_table) {
+      mtx_destroy(&virgl_resource_table_mutex);
       return ENOMEM;
+   }
 
    if (callbacks)
       pipe_callbacks = *callbacks;
@@ -84,15 +90,20 @@ virgl_resource_table_init(const struct virgl_resource_pipe_callbacks *callbacks)
 void
 virgl_resource_table_cleanup(void)
 {
+   mtx_lock(&virgl_resource_table_mutex);
    util_hash_table_destroy(virgl_resource_table);
    virgl_resource_table = NULL;
    memset(&pipe_callbacks, 0, sizeof(pipe_callbacks));
+   mtx_unlock(&virgl_resource_table_mutex);
+   mtx_destroy(&virgl_resource_table_mutex);
 }
 
 void
 virgl_resource_table_reset(void)
 {
+   mtx_lock(&virgl_resource_table_mutex);
    util_hash_table_clear(virgl_resource_table);
+   mtx_unlock(&virgl_resource_table_mutex);
 }
 
 static struct virgl_resource *
@@ -105,19 +116,21 @@ virgl_resource_create(uint32_t res_id)
    if (!res)
       return NULL;
 
-	res->table_id = res_id;
-	res->res_id = res_id;
-	res->fd_type = VIRGL_RESOURCE_FD_INVALID;
-	res->fd = -1;
+	mtx_lock(&virgl_resource_table_mutex);
 	err = util_hash_table_set(virgl_resource_table,
 	                          uintptr_to_pointer(res_id),
 	                          res);
+	mtx_unlock(&virgl_resource_table_mutex);
    if (err != PIPE_OK) {
       free(res);
       return NULL;
    }
 
-   return res;
+
+	res->res_id = res_id;
+	res->fd_type = VIRGL_RESOURCE_FD_INVALID;
+	res->fd = -1;
+	return res;
 }
 
 struct virgl_resource *
@@ -256,20 +269,15 @@ virgl_resource_create_from_metal_buffer(uint32_t res_id, void *metal_buffer)
 void
 virgl_resource_remove(uint32_t res_id)
 {
+   mtx_lock(&virgl_resource_table_mutex);
    util_hash_table_remove(virgl_resource_table, uintptr_to_pointer(res_id));
+   mtx_unlock(&virgl_resource_table_mutex);
 }
 
 struct virgl_resource *virgl_resource_lookup(uint32_t res_id)
 {
    return util_hash_table_get(virgl_resource_table,
                               uintptr_to_pointer(res_id));
-}
-
-void
-virgl_resource_set_context_id(struct virgl_resource *res, uint32_t res_id)
-{
-   if (res && res_id)
-      res->res_id = res_id;
 }
 
 struct virgl_resource_metal_texture_state *
@@ -345,10 +353,13 @@ virgl_resource_metal_texture_state_publish(
 void *
 virgl_resource_retain_metal_texture(uint32_t res_id)
 {
+	mtx_lock(&virgl_resource_table_mutex);
 	struct virgl_resource *res = util_hash_table_get(
 		virgl_resource_table, uintptr_to_pointer(res_id));
-	if (!res || res->fd_type != VIRGL_RESOURCE_METAL_HEAP)
+	if (!res || res->fd_type != VIRGL_RESOURCE_METAL_HEAP) {
+		mtx_unlock(&virgl_resource_table_mutex);
 		return NULL;
+	}
 
 	struct virgl_resource_metal_texture_state *state = res->metal_texture_state;
 	void *retained = NULL;
@@ -357,18 +368,24 @@ virgl_resource_retain_metal_texture(uint32_t res_id)
 		retained = state->texture ? (void *)CFRetain(state->texture) : NULL;
 		mtx_unlock(&state->mutex);
 	}
+	mtx_unlock(&virgl_resource_table_mutex);
 	return retained;
 }
 
 void *
 virgl_resource_retain_metal_buffer(uint32_t res_id)
 {
+	mtx_lock(&virgl_resource_table_mutex);
 	struct virgl_resource *res = util_hash_table_get(
 		virgl_resource_table, uintptr_to_pointer(res_id));
-	if (!res)
+	if (!res) {
+		mtx_unlock(&virgl_resource_table_mutex);
 		return NULL;
-	if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP)
+	}
+	if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP) {
+		mtx_unlock(&virgl_resource_table_mutex);
 		return NULL;
+	}
 
 	struct virgl_resource_metal_texture_state *state = res->metal_texture_state;
 	void *retained = NULL;
@@ -377,6 +394,7 @@ virgl_resource_retain_metal_buffer(uint32_t res_id)
 		retained = state->buffer ? (void *)CFRetain(state->buffer) : NULL;
 		mtx_unlock(&state->mutex);
 	}
+	mtx_unlock(&virgl_resource_table_mutex);
 	return retained;
 }
 

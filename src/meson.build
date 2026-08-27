@@ -53,6 +53,7 @@ vrend_winsys_gbm_sources = [
 ]
 
 vrend_winsys_egl_sources = [
+   'vrend/vrend_angle_blob_cache.c',
    'vrend/vrend_winsys_egl.c',
 ]
 

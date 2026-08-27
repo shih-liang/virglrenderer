@@ -49,6 +49,7 @@
 
 #include "virglrenderer.h"
 #include "vrend_winsys.h"
+#include "vrend_angle_blob_cache.h"
 #include "vrend_winsys_egl.h"
 #include "virgl_hw.h"
 #ifdef ENABLE_GBM
@@ -403,6 +404,10 @@ struct virgl_egl *virgl_egl_init(EGLNativeDisplayType display_id, bool surfacele
    virgl_debug("EGL extensions: %s\n", extensions);
 #endif
 
+#ifdef ENABLE_METAL
+   vrend_angle_blob_cache_enable(egl->egl_display, extensions);
+#endif
+
    if (!virgl_egl_add_extensions(egl, extensions))
       goto fail;
 
@@ -660,6 +665,9 @@ struct virgl_egl *virgl_egl_init_external(EGLDisplay egl_display)
    virgl_debug("EGL vendor: %s\n",
            eglQueryString(egl->egl_display, EGL_VENDOR));
    virgl_debug("EGL extensions: %s\n", extensions);
+#endif
+#ifdef ENABLE_METAL
+   vrend_angle_blob_cache_enable(egl->egl_display, extensions);
 #endif
    if (!virgl_egl_add_extensions(egl, extensions))
       goto fail;

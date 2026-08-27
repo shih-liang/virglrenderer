@@ -101,10 +101,6 @@ struct virgl_resource_vulkan_info {
  * typed when interop is expected.
  */
 struct virgl_resource {
-   /* Process-global lookup key used by a multi-device frontend. */
-   uint32_t table_id;
-
-   /* Resource handle visible inside the attached renderer context. */
    uint32_t res_id;
 
    struct pipe_resource *pipe_resource;
@@ -207,9 +203,6 @@ virgl_resource_remove(uint32_t res_id);
 
 struct virgl_resource *
 virgl_resource_lookup(uint32_t res_id);
-
-void
-virgl_resource_set_context_id(struct virgl_resource *res, uint32_t res_id);
 
 struct virgl_resource_metal_texture_state *
 virgl_resource_metal_texture_state_create(void);
