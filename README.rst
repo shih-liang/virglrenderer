@@ -21,6 +21,24 @@ This project uses the meson build system:
   $ ninja install
 
 
+macOS sandbox hosts
+-------------------
+
+When linking this renderer with static MoltenVK, configure with
+``-Ddefault_library=static -Dvenus=true -Dvulkan-dload=false
+-Drender-server-worker=thread``. Point ``-Dpkg_config_path`` at the supplied
+MoltenVK and epoxy package metadata. The final application must link the
+MoltenVK archive; do not enable ``vulkan-dload`` for this configuration, since
+that tries to open an external ``libvulkan.dylib`` at runtime instead.
+
+Before initializing the renderer, set ``XDG_RUNTIME_DIR`` to the application's
+private temporary directory (``FileManager.temporaryDirectory`` in an App
+Sandbox host). The macOS eventfd emulation and anonymous shared files use that
+directory, or ``TMPDIR`` when it is unset. They unlink their directory entries
+after creation; the descriptors, including copies sent over ``SCM_RIGHTS``,
+remain valid for their normal lifetime.
+
+
 Support
 -------
 

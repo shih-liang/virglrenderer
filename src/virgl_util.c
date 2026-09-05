@@ -112,8 +112,17 @@ int create_eventfd(unsigned int initval)
    struct sockaddr_un addr;
    memset(&addr, 0, sizeof(addr));
    addr.sun_family = AF_UNIX;
-   snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/virgl-evfd-%d-%u",
-            (int)getpid(), atomic_fetch_add(&serial, 1));
+   const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+   if (!runtime_dir || !runtime_dir[0])
+      runtime_dir = getenv("TMPDIR");
+   if (!runtime_dir || !runtime_dir[0])
+      runtime_dir = "/tmp";
+   int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/ve-%d-%u",
+                           runtime_dir, (int)getpid(), atomic_fetch_add(&serial, 1));
+   if (path_len < 0 || (size_t)path_len >= sizeof(addr.sun_path)) {
+      errno = ENAMETOOLONG;
+      return -1;
+   }
 
    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
    if (fd < 0)
@@ -122,14 +131,21 @@ int create_eventfd(unsigned int initval)
    unlink(addr.sun_path);
    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+      int saved_errno = errno;
       unlink(addr.sun_path);
       close(fd);
+      errno = saved_errno;
       return -1;
    }
    unlink(addr.sun_path);
 
-   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-   fcntl(fd, F_SETFD, FD_CLOEXEC);
+   if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0 ||
+       fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+      int saved_errno = errno;
+      close(fd);
+      errno = saved_errno;
+      return -1;
+   }
 
    if (initval)
       write_eventfd(fd, initval);

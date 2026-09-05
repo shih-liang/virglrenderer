@@ -134,7 +134,9 @@ os_create_anonymous_file(off_t size, const char *debug_name)
    char *name;
 
    path = getenv("XDG_RUNTIME_DIR");
-   if (!path)
+   if (!path || !path[0])
+      path = getenv("TMPDIR");
+   if (!path || !path[0])
       path = "/tmp";
 
    if (debug_name)
