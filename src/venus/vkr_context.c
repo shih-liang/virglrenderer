@@ -201,6 +201,8 @@ vkr_context_free_resource(struct hash_entry *entry)
       CFRelease(res->u.metal_heap);
    } else if (res->fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
       CFRelease(res->u.metal_buffer);
+   } else if (res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE) {
+      CFRelease(res->u.metal_texture);
    } else if (res->u.fd >= 0)
       close(res->u.fd);
    free(res);
@@ -326,7 +328,8 @@ vkr_context_import_resource_metal(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
    assert(fd_type == VIRGL_RESOURCE_METAL_HEAP ||
-          fd_type == VIRGL_RESOURCE_METAL_BUFFER);
+          fd_type == VIRGL_RESOURCE_METAL_BUFFER ||
+          fd_type == VIRGL_RESOURCE_METAL_TEXTURE);
 
    struct vkr_resource *res = calloc(1, sizeof(*res));
    if (!res)
@@ -343,6 +346,8 @@ vkr_context_import_resource_metal(struct vkr_context *ctx,
          free(res);
          return false;
       }
+   } else if (fd_type == VIRGL_RESOURCE_METAL_TEXTURE) {
+      res->u.metal_texture = (void *)CFRetain(metal_resource);
    } else {
       res->u.metal_buffer = (void *)CFRetain(metal_resource);
    }

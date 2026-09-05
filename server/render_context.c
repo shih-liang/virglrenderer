@@ -90,14 +90,17 @@ render_context_dispatch_import_resource(struct render_context *ctx,
       &request->import_resource;
 
    if (req->fd_type == VIRGL_RESOURCE_METAL_HEAP ||
-       req->fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
+       req->fd_type == VIRGL_RESOURCE_METAL_BUFFER ||
+       req->fd_type == VIRGL_RESOURCE_METAL_TEXTURE) {
       if (!ctx->in_process || fd_count != 0 || !req->res_ptr) {
          render_log("invalid Metal resource import for resource %u", req->res_id);
          return false;
       }
-      return render_state_import_resource_metal(ctx->ctx_id, req->res_id,
-                                                req->fd_type, req->res_ptr,
-                                                req->size);
+      const struct render_context_op_import_resource_reply reply = {
+         .success = render_state_import_resource_metal(
+            ctx->ctx_id, req->res_id, req->fd_type, req->res_ptr, req->size),
+      };
+      return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
    }
 
    if (fd_count != 1) {

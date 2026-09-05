@@ -93,6 +93,11 @@ static MTLTextureDescriptor *new_descriptor(const struct vrend_metal_texture_des
    return descriptor;
 }
 
+uint64_t virgl_metal_texture_size(MTLTexture_id texture)
+{
+   return [(id<MTLTexture>)texture allocatedSize];
+}
+
 bool virgl_metal_create_texture(MTLDevice_id device,
                                 const struct vrend_metal_texture_description *desc,
                                 MTLTexture_id *tex)

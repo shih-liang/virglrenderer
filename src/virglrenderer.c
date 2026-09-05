@@ -1313,6 +1313,7 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
          map = ctx->resource_map(ctx, res, NULL, PROT_WRITE | PROT_READ, MAP_SHARED);
          map_size = res->map_size;
          break;
+      case VIRGL_RESOURCE_METAL_TEXTURE:
       case VIRGL_RESOURCE_FD_INVALID:
          /* Avoid a default case so that -Wswitch will tell us at compile time
           * if a new virgl resource type is added without being handled here.
@@ -1369,6 +1370,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
       case VIRGL_RESOURCE_FD_OPAQUE:
       case VIRGL_RESOURCE_METAL_HEAP:
       case VIRGL_RESOURCE_METAL_BUFFER:
+      case VIRGL_RESOURCE_METAL_TEXTURE:
       case VIRGL_RESOURCE_FD_INVALID:
          /* Avoid a default case so that -Wswitch will tell us at compile time
           * if a new virgl resource type is added without being handled here.
@@ -1413,6 +1415,7 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       case VIRGL_RESOURCE_METAL_BUFFER:
          ret = 0;
          break;
+      case VIRGL_RESOURCE_METAL_TEXTURE:
       case VIRGL_RESOURCE_FD_INVALID:
          /* Avoid a default case so that -Wswitch will tell us at compile time
           * if a new virgl resource type is added without being handled here.
@@ -1463,6 +1466,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
    case VIRGL_RESOURCE_OPAQUE_HANDLE:
    case VIRGL_RESOURCE_METAL_HEAP:
    case VIRGL_RESOURCE_METAL_BUFFER:
+   case VIRGL_RESOURCE_METAL_TEXTURE:
    case VIRGL_RESOURCE_FD_INVALID:
       /* Avoid a default case so that -Wswitch will tell us at compile time if a
        * new virgl resource type is added without being handled here.

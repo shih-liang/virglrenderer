@@ -60,15 +60,19 @@ vkr_get_metal_info_from_resource_info(struct vkr_context *ctx,
       return false;
    }
 
-   if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP) {
+   if (res->fd_type != VIRGL_RESOURCE_METAL_HEAP &&
+       res->fd_type != VIRGL_RESOURCE_METAL_TEXTURE) {
       return false;
    }
 
    *out = (VkImportMemoryMetalHandleInfoEXT){
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
       .pNext = res_info->pNext,
-      .handle = res->u.metal_heap,
-      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+      .handle = res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE
+                   ? res->u.metal_texture : res->u.metal_heap,
+      .handleType = res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE
+                      ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT
+                      : VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
    };
    return true;
 }
@@ -545,16 +549,21 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       if (args->ret != VK_SUCCESS)
          return;
       memoryTypeBits = mem_fd_props.memoryTypeBits;
-   } else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP) {
-      static const VkExternalMemoryHandleTypeFlagBits handle_type =
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+   } else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP ||
+              res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE) {
+      const VkExternalMemoryHandleTypeFlagBits handle_type =
+         res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT
+            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+      void *handle = res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE
+                        ? res->u.metal_texture : res->u.metal_heap;
       VkMemoryMetalHandlePropertiesEXT mem_metal_props = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
          .pNext = NULL,
          .memoryTypeBits = 0,
       };
       args->ret =
-         vk->GetMemoryMetalHandlePropertiesEXT(args->device, handle_type, res->u.metal_heap, &mem_metal_props);
+         vk->GetMemoryMetalHandlePropertiesEXT(args->device, handle_type, handle, &mem_metal_props);
       if (args->ret != VK_SUCCESS)
          return;
       memoryTypeBits = mem_metal_props.memoryTypeBits;

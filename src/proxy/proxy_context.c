@@ -16,6 +16,11 @@
 
 #include "proxy_client.h"
 
+#ifdef ENABLE_METAL
+#include "vrend/vrend_renderer.h"
+#include "vrend/vrend_metal.h"
+#endif
+
 struct proxy_fence {
    uint32_t flags;
    uint32_t seqno;
@@ -483,6 +488,20 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    int res_fd = res->fd;
    uint64_t res_size = res->map_size;
    bool close_res_fd = false;
+   void *metal_resource = res_fd_type == VIRGL_RESOURCE_METAL_HEAP
+                             ? res->metal_heap
+                             : (res_fd_type == VIRGL_RESOURCE_METAL_BUFFER
+                                   ? res->metal_buffer : NULL);
+#ifdef ENABLE_METAL
+   if (res_fd_type == VIRGL_RESOURCE_FD_INVALID && res->pipe_resource &&
+       !(proxy_renderer.flags & VIRGL_RENDERER_RENDER_SERVER)) {
+      metal_resource = vrend_renderer_resource_metal_texture(res->pipe_resource);
+      if (metal_resource) {
+         res_fd_type = VIRGL_RESOURCE_METAL_TEXTURE;
+         res_size = virgl_metal_texture_size(metal_resource);
+      }
+   }
+#endif
    if (res_fd_type == VIRGL_RESOURCE_FD_INVALID) {
       /* importable pipe resouce can only export as dma-buf */
       res_fd_type = virgl_resource_export_fd(res, &res_fd);
@@ -490,7 +509,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
          /* close fd for unexpected fd type from succeeded export */
          if (res_fd_type != VIRGL_RESOURCE_FD_INVALID)
             close(res_fd);
-         proxy_log("exported res %d to unexpected fd_type %d", res_id, res_fd_type);
+         proxy_log("failed to export res %d: unexpected fd_type %d", res_id, res_fd_type);
          return;
       }
 
@@ -509,13 +528,12 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .res_id = res_id,
       .fd_type = res_fd_type,
       .size = res_size,
-      .res_ptr = res_fd_type == VIRGL_RESOURCE_METAL_HEAP
-                    ? res->metal_heap
-                    : (res_fd_type == VIRGL_RESOURCE_METAL_BUFFER
-                          ? res->metal_buffer : NULL),
+      .res_ptr = metal_resource,
    };
-   const bool sent = (res_fd_type == VIRGL_RESOURCE_METAL_HEAP ||
-                      res_fd_type == VIRGL_RESOURCE_METAL_BUFFER)
+   const bool is_metal = res_fd_type == VIRGL_RESOURCE_METAL_HEAP ||
+                         res_fd_type == VIRGL_RESOURCE_METAL_BUFFER ||
+                         res_fd_type == VIRGL_RESOURCE_METAL_TEXTURE;
+   const bool sent = is_metal
                         ? proxy_socket_send_request(&ctx->socket, &req, sizeof(req))
                         : proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
                                                              &res_fd, 1);
@@ -528,6 +546,15 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
 
    if (res_fd >= 0 && close_res_fd)
       close(res_fd);
+
+   if (is_metal) {
+      struct render_context_op_import_resource_reply reply;
+      if (!proxy_socket_receive_reply(&ctx->socket, &reply, sizeof(reply)) ||
+          !reply.success) {
+         proxy_log("failed to import Metal res %u", res_id);
+         return;
+      }
+   }
 
    proxy_context_resource_add(ctx, res_id);
 }

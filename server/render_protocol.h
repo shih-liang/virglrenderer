@@ -173,6 +173,12 @@ struct render_context_op_import_resource_request {
    /* Otherwise followed by 1 fd. */
 };
 
+/* Metal pointers must be retained and registered before the caller may
+ * complete CTX_ATTACH_RESOURCE or release the source resource. */
+struct render_context_op_import_resource_reply {
+   uint32_t success;
+};
+
 /* Free a blob resource from the context
  *
  * This roughly corresponds to:

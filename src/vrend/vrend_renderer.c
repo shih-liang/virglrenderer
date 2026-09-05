@@ -8706,7 +8706,12 @@ static void vrend_resource_metal_init(UNUSED struct vrend_resource *gr, UNUSED u
    if (!vrend_state.native_share_texture)
       return;
 
-   if ((gr->base.bind & VIRGL_RES_BIND_SCANOUT) == 0)
+   /* EGL may export an ordinary GL render target (e.g. GtkGLArea) without
+    * SCANOUT or SHARED having been requested at allocation time. Keep that
+    * texture Metal-backed from creation so Venus can import the same storage. */
+   if (gr->base.target != PIPE_TEXTURE_2D ||
+       !(gr->base.bind & (VIRGL_RES_BIND_SCANOUT | VIRGL_RES_BIND_SHARED |
+                          VIRGL_RES_BIND_RENDER_TARGET)))
       return;
 
    if (gr->base.depth0 != 1 || gr->base.last_level != 0 || gr->base.nr_samples > 1)

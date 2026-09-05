@@ -444,7 +444,8 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
 
       return ctx->export_opaque_handle(ctx, res, fd);
    } else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP ||
-              res->fd_type == VIRGL_RESOURCE_METAL_BUFFER) {
+              res->fd_type == VIRGL_RESOURCE_METAL_BUFFER ||
+              res->fd_type == VIRGL_RESOURCE_METAL_TEXTURE) {
       return VIRGL_RESOURCE_FD_INVALID;
    } else if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
       *fd = os_dupfd_cloexec(res->fd);

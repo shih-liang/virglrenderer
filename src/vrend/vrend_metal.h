@@ -43,6 +43,7 @@ bool virgl_metal_retain_texture(MTLTexture_id source,
 
 uint64_t virgl_metal_heap_size(MTLHeap_id heap);
 uint64_t virgl_metal_buffer_size(MTLBuffer_id buffer);
+uint64_t virgl_metal_texture_size(MTLTexture_id texture);
 void *virgl_metal_buffer_contents(MTLBuffer_id buffer);
 
 void virgl_metal_release_texture(MTLTexture_id tex);

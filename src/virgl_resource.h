@@ -72,6 +72,9 @@ enum virgl_resource_fd_type {
    /** A shared MTLBuffer used for ordinary host-visible Venus memory. */
    VIRGL_RESOURCE_METAL_BUFFER,
 
+   /** An exact ANGLE texture imported by another renderer in this process. */
+   VIRGL_RESOURCE_METAL_TEXTURE,
+
    VIRGL_RESOURCE_FD_INVALID = -1,
 };
 

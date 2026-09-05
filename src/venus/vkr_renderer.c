@@ -252,7 +252,8 @@ vkr_renderer_import_resource_metal(uint32_t ctx_id,
 
    if (!res_id || !metal_resource || !size ||
        (fd_type != VIRGL_RESOURCE_METAL_HEAP &&
-        fd_type != VIRGL_RESOURCE_METAL_BUFFER))
+        fd_type != VIRGL_RESOURCE_METAL_BUFFER &&
+        fd_type != VIRGL_RESOURCE_METAL_TEXTURE))
       return false;
 
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);

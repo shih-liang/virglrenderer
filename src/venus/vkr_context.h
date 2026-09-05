@@ -34,6 +34,8 @@ struct vkr_resource {
       MTLResource_id metal_heap;
       /* valid when fd_type is metal buffer */
       MTLResource_id metal_buffer;
+      /* valid when fd_type is metal texture */
+      MTLResource_id metal_texture;
    } u;
 
    /* Shared with the global virgl resource for exact VkImage publication. */
