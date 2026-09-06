@@ -117,7 +117,9 @@ if with_drm_renderers
   conf_data.set('ENABLE_DRM', 1)
 endif
 
-libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: with_drm_renderers or get_option('video'))
+libdrm_dep = dependency(
+  'libdrm', version : '>=2.4.50',
+  required: with_drm_renderers or (get_option('video') and host_machine.system() != 'darwin'))
 libdrm_amdgpu_dep = dependency('libdrm_amdgpu', version : '>=2.4.121', required: with_drm_amdgpu)
 conf_data.set('ENABLE_LIBDRM', libdrm_dep.found())
 drm_uapi_dep = declare_dependency(
@@ -402,8 +404,14 @@ if with_video
      error('video require EGL, but it is not available')
   endif
   conf_data.set('ENABLE_VIDEO', 1)
-  libva_dep = dependency('libva')
-  libvadrm_dep = dependency('libva-drm')
+  if with_host_darwin
+    videotoolbox_dep = dependency(
+      'appleframeworks',
+      modules : ['VideoToolbox', 'CoreMedia', 'CoreVideo', 'IOSurface'])
+  else
+    libva_dep = dependency('libva')
+    libvadrm_dep = dependency('libva-drm')
+  endif
 endif
 
 with_tests = get_option('tests')

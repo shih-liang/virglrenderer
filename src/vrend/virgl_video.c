@@ -438,28 +438,29 @@ static void destroy_video_dma_buf(struct virgl_video_dma_buf *dmabuf)
     }
 }
 
-static void encode_upload_picture(struct virgl_video_codec *codec,
+static int encode_upload_picture(struct virgl_video_codec *codec,
                                   struct virgl_video_buffer *buffer)
 {
     VAStatus va_stat;
 
     if (!callbacks || !callbacks->encode_upload_picture)
-        return;
+        return -1;
 
     va_stat = vaSyncSurface(va_dpy, buffer->va_sfc);
     if (VA_STATUS_SUCCESS != va_stat) {
         virgl_error("sync surface failed, err = 0x%x\n", va_stat);
-        return;
+        return -1;
     }
 
     if (!buffer->dmabuf)
         buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_WRITE_ONLY);
 
     if (buffer->dmabuf)
-        callbacks->encode_upload_picture(codec, buffer->dmabuf);
+        return callbacks->encode_upload_picture(codec, buffer->dmabuf);
+    return -1;
 }
 
-static void encode_completed(struct virgl_video_codec *codec,
+static int encode_completed(struct virgl_video_codec *codec,
                              struct virgl_video_buffer *buffer)
 {
     VAStatus va_stat;
@@ -467,14 +468,15 @@ static void encode_completed(struct virgl_video_codec *codec,
     void **coded_bufs = NULL;
     unsigned *coded_sizes = NULL;
     unsigned i, num_coded_bufs = 0;
+    int result = -1;
 
     if (!callbacks || !callbacks->encode_completed)
-        return;
+        return -1;
 
     va_stat = vaMapBuffer(va_dpy, codec->va_coded_buf, (void **)(&buf_list));
     if (VA_STATUS_SUCCESS != va_stat) {
         virgl_error("map coded buffer failed, err = 0x%x\n", va_stat);
-        return;
+        return -1;
     }
 
     for (buf = buf_list; buf; buf = (VACodedBufferSegment *)buf->next)
@@ -492,26 +494,28 @@ static void encode_completed(struct virgl_video_codec *codec,
         coded_sizes[i++] = buf->size;
     }
 
-    callbacks->encode_completed(codec, buffer->dmabuf, NULL, num_coded_bufs,
+    result = callbacks->encode_completed(codec, buffer->dmabuf, NULL, num_coded_bufs,
                                 (const void * const*)coded_bufs, coded_sizes);
 
 fail_unmap_buffer:
     vaUnmapBuffer(va_dpy, codec->va_coded_buf);
     free(coded_bufs);
     free(coded_sizes);
+    return result;
 }
 
-static void decode_completed(struct virgl_video_codec *codec,
+static int decode_completed(struct virgl_video_codec *codec,
                              struct virgl_video_buffer *buffer)
 {
     if (!callbacks || !callbacks->decode_completed)
-        return;
+        return -1;
 
     if (!buffer->dmabuf)
         buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_READ_ONLY);
 
     if (buffer->dmabuf)
-        callbacks->decode_completed(codec, buffer->dmabuf);
+        return callbacks->decode_completed(codec, buffer->dmabuf);
+    return -1;
 }
 
 static VASurfaceID get_enc_ref_pic(struct virgl_video_codec *codec,
@@ -909,8 +913,9 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
     if (!va_dpy || !codec || !target)
         return -1;
 
-    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
-        encode_upload_picture(codec, target);
+    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE &&
+        encode_upload_picture(codec, target))
+        return -1;
 
     codec->buffer = target;
     va_stat = vaBeginPicture(va_dpy, codec->va_ctx, target->va_sfc);
@@ -3197,11 +3202,10 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
     }
 
     if (codec->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE) {
-        decode_completed(codec, target);
+        return decode_completed(codec, target);
     } else {
-        encode_completed(codec, target);
+        return encode_completed(codec, target);
     }
 
     return 0;
 }
-

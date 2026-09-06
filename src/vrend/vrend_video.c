@@ -74,6 +74,10 @@
 #include "vrend_renderer.h"
 #include "vrend_video.h"
 
+#define VREND_VIDEO_FOURCC(a, b, c, d) \
+    ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
+     ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
 struct vrend_context;
 
 struct vrend_video_context {
@@ -85,8 +89,8 @@ struct vrend_video_context {
 struct vrend_video_codec {
     struct virgl_video_codec *codec;
     uint32_t handle;
-    struct vrend_resource *feed_res;    /* encoding feedback */
-    struct vrend_resource *dest_res;    /* encoding coded buffer */
+    uint32_t feed_handle;    /* Look up again at completion: resources may detach. */
+    uint32_t dest_handle;
     struct vrend_video_context *ctx;
     struct list_head head;
 };
@@ -94,7 +98,6 @@ struct vrend_video_codec {
 struct vrend_video_plane {
     uint32_t res_handle;
     GLuint texture;         /* texture for temporary use */
-    GLuint framebuffer;     /* framebuffer for temporary use */
     EGLImageKHR egl_image;  /* egl image for temporary use */
 };
 
@@ -146,154 +149,135 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
-static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
-                                       const struct virgl_video_dma_buf *dmabuf)
+/* Video transfers share the guest's GL context. Preserve real GL state so the
+ * renderer's cached bindings remain valid, including PBOs and pixel offsets. */
+static int sync_video_planes(struct vrend_video_buffer *buf,
+                             const struct virgl_video_dma_buf *dmabuf,
+                             bool download)
 {
-    if (!(dmabuf->flags & VIRGL_VIDEO_DMABUF_READ_ONLY)) {
-        virgl_error("%s: dmabuf is not readable\n", __func__);
+    static const GLenum stores[] = {
+        GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS,
+        GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS,
+        GL_UNPACK_SKIP_ROWS,
+    };
+    GLint previous[ARRAY_SIZE(stores)], texture, framebuffer, pack, unpack;
+    GLuint transfer_fbo = 0;
+    int result = -1;
+    uint32_t required = download ? VIRGL_VIDEO_DMABUF_READ_ONLY
+                                : VIRGL_VIDEO_DMABUF_WRITE_ONLY;
+    if (!dmabuf || !(dmabuf->flags & required) ||
+        !dmabuf->num_planes || dmabuf->num_planes != buf->num_planes)
         return -1;
-    }
 
-    for (unsigned i = 0; i < dmabuf->num_planes && i < buf->num_planes; i++) {
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &framebuffer);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+    for (unsigned i = 0; i < ARRAY_SIZE(stores); i++) {
+        glGetIntegerv(stores[i], &previous[i]);
+        glPixelStorei(stores[i], i == 0 || i == 4 ? 1 : 0);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    for (unsigned i = 0; i < buf->num_planes; i++) {
         struct vrend_video_plane *plane = &buf->planes[i];
-        struct vrend_resource *res;
+        const struct virgl_video_dma_buf_plane *mapping = &dmabuf->planes[i];
+        struct vrend_resource *res =
+            vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
+        if (!res || res->target != GL_TEXTURE_2D)
+            goto out;
 
-        res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
-        if (!res) {
-            virgl_error("%s: res %d not found\n", __func__, plane->res_handle);
-            continue;
+        if (mapping->data) {
+            bool p010 = dmabuf->drm_format == VREND_VIDEO_FOURCC('P', '0', '1', '0');
+            enum pipe_format expected = p010 ?
+                (i ? PIPE_FORMAT_R16G16_UNORM : PIPE_FORMAT_R16_UNORM) :
+                (i ? PIPE_FORMAT_R8G8_UNORM : PIPE_FORMAT_R8_UNORM);
+            unsigned bpp = (i ? 2 : 1) * (p010 ? 2 : 1);
+            unsigned width = (dmabuf->width + (i ? 1 : 0)) >> (i ? 1 : 0);
+            unsigned height = (dmabuf->height + (i ? 1 : 0)) >> (i ? 1 : 0);
+            if ((!p010 && dmabuf->drm_format != VREND_VIDEO_FOURCC('N', 'V', '1', '2')) ||
+                dmabuf->num_planes != 2 || res->base.format != expected ||
+                mapping->width < width || mapping->height < height ||
+                res->base.width0 < width || res->base.height0 < height ||
+                mapping->pitch % bpp || mapping->pitch / bpp < width ||
+                (uint64_t)mapping->pitch * height > mapping->size)
+                goto out;
+            if (download) {
+                glBindTexture(GL_TEXTURE_2D, res->gl_id);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, mapping->pitch / bpp);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                                i ? GL_RG : GL_RED,
+                                p010 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
+                                mapping->data);
+            } else {
+                if (!transfer_fbo) glGenFramebuffers(1, &transfer_fbo);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, transfer_fbo);
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, res->gl_id, 0);
+                if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                    goto out;
+                glPixelStorei(GL_PACK_ROW_LENGTH, mapping->pitch / bpp);
+                glReadPixels(0, 0, width, height, i ? GL_RG : GL_RED,
+                             p010 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, mapping->data);
+            }
+        } else {
+            if (plane->egl_image == EGL_NO_IMAGE_KHR) {
+                EGLint attributes[] = {
+                    EGL_LINUX_DRM_FOURCC_EXT, mapping->drm_format,
+                    EGL_WIDTH, res->base.width0,
+                    EGL_HEIGHT, res->base.height0,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, mapping->fd,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, mapping->offset,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, mapping->pitch, EGL_NONE,
+                };
+                plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+                    EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
+            }
+            if (plane->egl_image == EGL_NO_IMAGE_KHR)
+                goto out;
+            glBindTexture(GL_TEXTURE_2D, plane->texture);
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, plane->egl_image);
+            if (!transfer_fbo) glGenFramebuffers(1, &transfer_fbo);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, transfer_fbo);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D, download ? plane->texture : res->gl_id, 0);
+            if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                goto out;
+            glBindTexture(GL_TEXTURE_2D, download ? res->gl_id : plane->texture);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                res->base.width0, res->base.height0);
         }
-
-        /* dmabuf -> eglimage */
-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            EGLint img_attrs[16] = {
-                EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
-                EGL_WIDTH,                      dmabuf->width / (i + 1),
-                EGL_HEIGHT,                     dmabuf->height / (i + 1),
-                EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
-                EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
-                EGL_NONE
-            };
-
-            plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
-                    EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
-        }
-
-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            virgl_error("%s: create egl image failed\n", __func__);
-            continue;
-        }
-
-        /* eglimage -> texture */
-        glBindTexture(GL_TEXTURE_2D, plane->texture);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,
-                                    (GLeglImageOES)(plane->egl_image));
-
-        /* texture -> framebuffer */
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, plane->framebuffer);
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, plane->texture, 0);
-
-        /* framebuffer -> vrend_video_buffer.planes[i] */
-        glBindTexture(GL_TEXTURE_2D, res->gl_id);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                            res->base.width0, res->base.height0);
+        if (glGetError() != GL_NO_ERROR)
+            goto out;
     }
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    return 0;
+    result = 0;
+out:
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glDeleteFramebuffers(1, &transfer_fbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pack);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
+    for (unsigned i = 0; i < ARRAY_SIZE(stores); i++)
+        glPixelStorei(stores[i], previous[i]);
+    return result;
 }
 
-static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
-                                       const struct virgl_video_dma_buf *dmabuf)
+static int vrend_video_decode_completed(struct virgl_video_codec *codec,
+                                        const struct virgl_video_dma_buf *dmabuf)
 {
-    if (!(dmabuf->flags & VIRGL_VIDEO_DMABUF_WRITE_ONLY)) {
-        virgl_error("%s: dmabuf is not writable\n", __func__);
-        return -1;
-    }
-
-    for (unsigned i = 0; i < dmabuf->num_planes && i < buf->num_planes; i++) {
-        struct vrend_video_plane *plane = &buf->planes[i];
-        struct vrend_resource *res;
-
-        res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
-        if (!res) {
-            virgl_error("%s: res %d not found\n", __func__, plane->res_handle);
-            continue;
-        }
-
-        /* dmabuf -> eglimage */
-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            EGLint img_attrs[16] = {
-                EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
-                EGL_WIDTH,                      dmabuf->width / (i + 1),
-                EGL_HEIGHT,                     dmabuf->height / (i + 1),
-                EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
-                EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
-                EGL_NONE
-            };
-
-            plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
-                    EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
-        }
-
-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            virgl_error("%s: create egl image failed\n", __func__);
-            continue;
-        }
-
-        /* eglimage -> texture */
-        glBindTexture(GL_TEXTURE_2D, plane->texture);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,
-                                    (GLeglImageOES)(plane->egl_image));
-
-        /* vrend_video_buffer.planes[i] -> framebuffer */
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, plane->framebuffer);
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, res->gl_id, 0);
-
-        /* framebuffer -> texture */
-        glBindTexture(GL_TEXTURE_2D, plane->texture);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                            res->base.width0, res->base.height0);
-
-    }
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    return 0;
-}
-
-
-static void vrend_video_decode_completed(
-                                struct virgl_video_codec *codec,
-                                const struct virgl_video_dma_buf *dmabuf)
-{
-    struct vrend_video_buffer *buf = vrend_video_buffer(dmabuf->buf);
-
     (void)codec;
-
-    sync_dmabuf_to_video_buffer(buf, dmabuf);
+    return sync_video_planes(vrend_video_buffer(dmabuf->buf), dmabuf, true);
 }
 
-
-static void vrend_video_enocde_upload_picture(
-                                struct virgl_video_codec *codec,
-                                const struct virgl_video_dma_buf *dmabuf)
+static int vrend_video_encode_upload_picture(struct virgl_video_codec *codec,
+                                              const struct virgl_video_dma_buf *dmabuf)
 {
-    struct vrend_video_buffer *buf = vrend_video_buffer(dmabuf->buf);
-
     (void)codec;
-
-    sync_video_buffer_to_dmabuf(buf, dmabuf);
+    return sync_video_planes(vrend_video_buffer(dmabuf->buf), dmabuf, false);
 }
 
-static void vrend_video_encode_completed(
+static int vrend_video_encode_completed(
                                 struct virgl_video_codec *codec,
                                 const struct virgl_video_dma_buf *src_buf,
                                 const struct virgl_video_dma_buf *ref_buf,
@@ -301,61 +285,62 @@ static void vrend_video_encode_completed(
                                 const void * const *coded_bufs,
                                 const unsigned *coded_sizes)
 {
-    void *buf;
-    unsigned i, size, data_size;
-    struct virgl_video_encode_feedback feedback;
     struct vrend_video_codec *cdc = vrend_video_codec(codec);
-
+    struct vrend_resource *dest =
+        vrend_renderer_ctx_res_lookup(cdc->ctx->ctx, cdc->dest_handle);
+    struct vrend_resource *feed =
+        vrend_renderer_ctx_res_lookup(cdc->ctx->ctx, cdc->feed_handle);
+    struct virgl_video_encode_feedback feedback = {
+        .stat = VIRGL_VIDEO_ENCODE_STAT_FAILURE,
+    };
+    GLint previous;
+    size_t total = 0;
     (void)src_buf;
     (void)ref_buf;
-
-    if (!cdc->dest_res || !cdc->feed_res)
-        return;
-
-    memset(&feedback, 0, sizeof(feedback));
-
-    /* sync coded data to guest */
-    if (has_bit(cdc->dest_res->storage_bits, VREND_STORAGE_GL_BUFFER)) {
-        glBindBufferARB(cdc->dest_res->target, cdc->dest_res->gl_id);
-        buf = glMapBufferRange(cdc->dest_res->target, 0,
-                               cdc->dest_res->base.width0, GL_MAP_WRITE_BIT);
-        for (i = 0, data_size = 0; i < num_coded_bufs &&
-                    data_size < cdc->dest_res->base.width0; i++) {
-            size = MIN2(cdc->dest_res->base.width0 - data_size, coded_sizes[i]);
-            memcpy((uint8_t *)buf + data_size, coded_bufs[i], size);
-            vrend_write_to_iovec(cdc->dest_res->iov, cdc->dest_res->num_iovs,
-                                 data_size, coded_bufs[i], size);
-            data_size += size;
-        }
-        glUnmapBuffer(cdc->dest_res->target);
-        glBindBufferARB(cdc->dest_res->target, 0);
-        feedback.stat = VIRGL_VIDEO_ENCODE_STAT_SUCCESS;
-        feedback.coded_size = data_size;
-    } else {
-        virgl_warn("unexcepted coded res type\n");
-        feedback.stat = VIRGL_VIDEO_ENCODE_STAT_FAILURE;
-        feedback.coded_size = 0;
+    cdc->dest_handle = cdc->feed_handle = 0;
+    if (!feed || vrend_get_iovec_size(feed->iov, feed->num_iovs) < sizeof(feedback))
+        return -1;
+    if (!dest || !has_bit(dest->storage_bits, VREND_STORAGE_GL_BUFFER) ||
+        !num_coded_bufs || !coded_bufs || !coded_sizes)
+        goto out;
+    /* Never truncate a bitstream and report success. Validate before writing. */
+    for (unsigned i = 0; i < num_coded_bufs; i++) {
+        if (!coded_bufs[i] || coded_sizes[i] > dest->base.width0 - total)
+            goto out;
+        total += coded_sizes[i];
     }
-
-    /* send feedback */
-    vrend_write_to_iovec(cdc->feed_res->iov, cdc->feed_res->num_iovs,
-                         0, (char *)(&feedback),
-                         MIN2(cdc->feed_res->base.width0, sizeof(feedback)));
-
-    cdc->dest_res = NULL;
-    cdc->feed_res = NULL;
+    if (!total || vrend_get_iovec_size(dest->iov, dest->num_iovs) < total)
+        goto out;
+    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &previous);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, dest->gl_id);
+    for (unsigned i = 0, offset = 0; i < num_coded_bufs; i++) {
+        glBufferSubData(GL_COPY_WRITE_BUFFER, offset, coded_sizes[i], coded_bufs[i]);
+        vrend_write_to_iovec(dest->iov, dest->num_iovs, offset, coded_bufs[i], coded_sizes[i]);
+        offset += coded_sizes[i];
+    }
+    if (glGetError() == GL_NO_ERROR) {
+        feedback.stat = VIRGL_VIDEO_ENCODE_STAT_SUCCESS;
+        feedback.coded_size = total;
+    }
+    glBindBuffer(GL_COPY_WRITE_BUFFER, previous);
+out:
+    vrend_write_to_iovec(feed->iov, feed->num_iovs, 0,
+                         (const char *)&feedback, sizeof(feedback));
+    return feedback.stat == VIRGL_VIDEO_ENCODE_STAT_SUCCESS ? 0 : -1;
 }
 
 static struct virgl_video_callbacks video_callbacks = {
     .decode_completed           = vrend_video_decode_completed,
-    .encode_upload_picture      = vrend_video_enocde_upload_picture,
+    .encode_upload_picture      = vrend_video_encode_upload_picture,
     .encode_completed           = vrend_video_encode_completed,
 };
 
 int vrend_video_init(int drm_fd)
 {
+#ifndef __APPLE__
     if (drm_fd < 0)
         return -1;
+#endif
 
     return virgl_video_init(drm_fd, &video_callbacks, 0);
 }
@@ -494,14 +479,7 @@ int vrend_video_create_buffer(struct vrend_video_context *ctx,
 
         plane = &buf->planes[buf->num_planes++];
         plane->res_handle = res_handles[i];
-        glGenFramebuffers(1, &plane->framebuffer);
         glGenTextures(1, &plane->texture);
-        glBindTexture(GL_TEXTURE_2D, plane->texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     buf->handle = handle;
@@ -525,8 +503,7 @@ static void destroy_video_buffer(struct vrend_video_buffer *buf)
         plane = &buf->planes[i];
 
         glDeleteTextures(1, &plane->texture);
-        glDeleteFramebuffers(1, &plane->framebuffer);
-        if (plane->egl_image == EGL_NO_IMAGE_KHR)
+        if (plane->egl_image != EGL_NO_IMAGE_KHR)
             eglDestroyImageKHR(eglGetCurrentDisplay(), plane->egl_image);
     }
 
@@ -559,6 +536,8 @@ struct vrend_video_context *vrend_video_create_context(struct vrend_context *ctx
 
 void vrend_video_destroy_context(struct vrend_video_context *ctx)
 {
+   if (!ctx)
+      return;
    list_for_each_entry_safe(struct vrend_video_codec, vcdc, &ctx->codecs, head)
       destroy_video_codec(vcdc);
 
@@ -765,10 +744,12 @@ int vrend_video_decode_bitstream(struct vrend_video_context *ctx,
 
     for (i = 0, num_bs = 0; i < num_buffers; i++) {
         res = vrend_renderer_ctx_res_lookup(ctx->ctx, buffer_handles[i]);
-        if (!res || !res->ptr) {
+        if (!res || !res->ptr || !buffer_sizes[i] ||
+            buffer_sizes[i] > res->base.width0 ||
+            vrend_get_iovec_size(res->iov, res->num_iovs) < buffer_sizes[i]) {
             virgl_warn("%s: bs res %d invalid or not found",
                        __func__, buffer_handles[i]);
-            continue;
+            goto err;
         }
 
         vrend_read_from_iovec(res->iov, res->num_iovs, 0,
@@ -815,7 +796,9 @@ int vrend_video_encode_bitstream(struct vrend_video_context *ctx,
 
     /* Feedback resource */
     feed_res = vrend_renderer_ctx_res_lookup(ctx->ctx, feed_handle);
-    if (!feed_res) {
+    if (!feed_res || feed_res->base.width0 < sizeof(struct virgl_video_encode_feedback) ||
+        vrend_get_iovec_size(feed_res->iov, feed_res->num_iovs) <
+            sizeof(struct virgl_video_encode_feedback)) {
         virgl_error("%s: feedback res %d not found\n", __func__, feed_handle);
         return -1;
     }
@@ -837,8 +820,8 @@ int vrend_video_encode_bitstream(struct vrend_video_context *ctx,
         return -1;
     }
 
-    cdc->feed_res = feed_res;
-    cdc->dest_res = dest_res;
+    cdc->feed_handle = feed_handle;
+    cdc->dest_handle = dest_handle;
 
     return virgl_video_encode_bitstream(cdc->codec, src->buffer, &desc);
 }
@@ -855,4 +838,3 @@ int vrend_video_end_frame(struct vrend_video_context *ctx,
 
     return virgl_video_end_frame(cdc->codec, tgt->buffer);
 }
-

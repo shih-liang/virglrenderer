@@ -39,6 +39,49 @@ after creation; the descriptors, including copies sent over ``SCM_RIGHTS``,
 remain valid for their normal lifetime.
 
 
+macOS video
+-----------
+
+Configure with ``-Dvideo=true`` and pass ``VIRGL_RENDERER_USE_VIDEO`` to
+``virgl_renderer_init``. A DRM fd callback is not required on macOS. Static
+consumers must link VideoToolbox, CoreMedia, CoreVideo and IOSurface in addition
+to their existing ANGLE/Metal dependencies.
+
+The backend requests hardware sessions only. Guest capabilities currently
+include H.264 decode/encode, HEVC Main/Main10 encode, and JPEG/VP9 decode when
+VideoToolbox reports hardware support. HEVC and AV1 decode are not advertised:
+the stateless guest protocol does not carry all the original parameter sets
+required by VideoToolbox. Direct backend callers supplying complete bitstreams
+can use the retained HEVC/AV1 paths; this is not general guest VA-API support.
+Capability dimensions/levels are backend ceilings, not per-device
+measurements; creating the hardware session remains authoritative.
+
+Decode commands accumulate until ``END_FRAME`` and produce one picture.
+Compatible parameter-set changes preserve the decoder session and its
+reference pictures. Completion callbacks are synchronous and return errors to
+the VGL context. Encoder controls currently cover profile, bitrate, frame rate
+and keyframes, not every Gallium rate-control/reference-picture option.
+
+This implementation is not zero-copy YUV: CVPixelBuffer planes are uploaded to
+guest GL textures on decode and read back on encode. Sharing IOSurface Metal
+planes with the renderer, with explicit resource ownership and synchronization,
+is a separate optimization. Codec work also completes synchronously; callers
+must not interpret the hardware path as an asynchronous throughput guarantee.
+
+The focused macOS checks use existing static archives and require no guest,
+downloads, libcheck or VM restart:
+
+.. code-block:: sh
+
+  bash tests/run_videotoolbox.sh /path/to/vgl-build /path/to/angle-prefix /path/to/libMoltenVK.a
+
+They check framing and frame lifetime, hardware encode/decode round trips,
+NV12/P010 transfers and GL state restoration, and the public VGL video command
+and error paths. ASan/UBSan instrument the test translation units (which include
+the backend and transfer implementation); prebuilt dependency archives are not
+instrumented. These checks do not substitute for guest VA-API/application tests.
+
+
 Support
 -------
 

@@ -48,7 +48,6 @@
 
 #include "util/u_formats.h"
 #include "pipe/p_video_enums.h"
-#include "util/u_formats.h"
 
 struct virgl_video_codec;
 struct virgl_video_buffer;
@@ -96,6 +95,11 @@ struct virgl_video_dma_buf {
         int modifier;
         uint32_t offset;
         uint32_t pitch;
+        /// Optional CPU mapping used by non-dmabuf backends such as macOS
+        /// VideoToolbox. It is valid only for the duration of the callback.
+        void *data;
+        uint32_t width;
+        uint32_t height;
     } planes[4];
 };
 
@@ -106,18 +110,19 @@ struct virgl_video_dma_buf {
  * better shield the underlying logic differences.
  */
 struct virgl_video_callbacks {
+    /* Callbacks are synchronous and return 0 on success, nonzero on failure. */
     /* Callback when decoding is complete, used to download the decoded picture
      * from the video buffer */
-    void (*decode_completed)(struct virgl_video_codec *codec,
+    int (*decode_completed)(struct virgl_video_codec *codec,
                              const struct virgl_video_dma_buf *dmabuf);
 
     /* Upload the picture data to be encoded to the video buffer */
-    void (*encode_upload_picture)(struct virgl_video_codec *codec,
+    int (*encode_upload_picture)(struct virgl_video_codec *codec,
                                   const struct virgl_video_dma_buf *dmabuf);
 
     /* Callback when encoding is complete, used to download the encoded data
      * and reference picture */
-    void (*encode_completed)(struct virgl_video_codec *codec,
+    int (*encode_completed)(struct virgl_video_codec *codec,
                              const struct virgl_video_dma_buf *src_buf,
                              const struct virgl_video_dma_buf *ref_buf,
                              unsigned num_coded_bufs,
@@ -160,4 +165,3 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
                           struct virgl_video_buffer *target);
 
 #endif /* VIRGL_VIDEO_H */
-

@@ -7870,10 +7870,10 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
 #ifdef ENABLE_VIDEO
    if (flags & VREND_USE_VIDEO) {
-        if (vrend_clicbs->get_drm_fd)
-            vrend_video_init(vrend_clicbs->get_drm_fd());
-        else
-            virgl_warn("Video disabled due to missing get_drm_fd\n");
+      /* VideoToolbox has no DRM device. The selected backend validates fd. */
+      int fd = vrend_clicbs->get_drm_fd ? vrend_clicbs->get_drm_fd() : -1;
+      if (vrend_video_init(fd))
+         virgl_warn("Video backend initialization failed\n");
    }
 #endif
 
@@ -8061,6 +8061,12 @@ void vrend_destroy_context(struct vrend_context *ctx)
 
    vrend_set_index_buffer(ctx, 0, 0, 0);
 
+#ifdef ENABLE_VIDEO
+   /* Destroy video GL objects before destroying their share-group contexts. */
+   vrend_video_destroy_context(ctx->video);
+   ctx->video = NULL;
+#endif
+
    list_for_each_entry_safe_rev(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
       ctx->sub = sub;
       vrend_destroy_sub_context(sub);
@@ -8072,10 +8078,6 @@ void vrend_destroy_context(struct vrend_context *ctx)
       vrend_renderer_force_ctx_0();
 
    vrend_free_fences_for_context(ctx);
-
-#ifdef ENABLE_VIDEO
-   vrend_video_destroy_context(ctx->video);
-#endif
 
    list_for_each_entry_safe(struct vrend_resource, res, &ctx->vrend_resources, head) {
       free(res);

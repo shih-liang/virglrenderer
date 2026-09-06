@@ -1771,6 +1771,8 @@ static int vrend_decode_create_video_codec(struct vrend_context *ctx,
                                            uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_CREATE_VIDEO_CODEC_MIN_SIZE)
       return EINVAL;
@@ -1787,10 +1789,8 @@ static int vrend_decode_create_video_codec(struct vrend_context *ctx,
    if (length >= VIRGL_CREATE_VIDEO_CODEC_MAX_REF)
       max_ref = get_buf_entry(buf, VIRGL_CREATE_VIDEO_CODEC_MAX_REF);
 
-   vrend_video_create_codec(vctx, handle, profile, entrypoint,
-                            chroma_fmt, level, width, height, max_ref, 0);
-
-   return 0;
+   return vrend_video_create_codec(vctx, handle, profile, entrypoint,
+                            chroma_fmt, level, width, height, max_ref, 0) ? EINVAL : 0;
 }
 
 static int vrend_decode_destroy_video_codec(struct vrend_context *ctx,
@@ -1798,6 +1798,8 @@ static int vrend_decode_destroy_video_codec(struct vrend_context *ctx,
                                             uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
     if (length < VIRGL_DESTROY_VIDEO_CODEC_MIN_SIZE)
        return EINVAL;
@@ -1815,6 +1817,8 @@ static int vrend_decode_create_video_buffer(struct vrend_context *ctx,
    uint32_t i, num_res;
    uint32_t res_handles[VREND_VIDEO_BUFFER_PLANE_NUM];
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_CREATE_VIDEO_BUFFER_MIN_SIZE)
       return EINVAL;
@@ -1833,10 +1837,8 @@ static int vrend_decode_create_video_buffer(struct vrend_context *ctx,
        res_handles[i] = get_buf_entry(buf,
                                       VIRGL_CREATE_VIDEO_BUFFER_RES_BASE + i);
 
-   vrend_video_create_buffer(vctx, handle, format, width, height,
-                                      res_handles, num_res);
-
-   return 0;
+   return vrend_video_create_buffer(vctx, handle, format, width, height,
+                                      res_handles, num_res) ? EINVAL : 0;
 }
 
 static int vrend_decode_destroy_video_buffer(struct vrend_context *ctx,
@@ -1844,6 +1846,8 @@ static int vrend_decode_destroy_video_buffer(struct vrend_context *ctx,
                                              uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_DESTROY_VIDEO_BUFFER_MIN_SIZE)
       return EINVAL;
@@ -1859,15 +1863,15 @@ static int vrend_decode_begin_frame(struct vrend_context *ctx,
                                     uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_BEGIN_FRAME_MIN_SIZE)
       return EINVAL;
 
    uint32_t cdc_handle = get_buf_entry(buf, VIRGL_BEGIN_FRAME_CDC_HANDLE);
    uint32_t tgt_handle = get_buf_entry(buf, VIRGL_BEGIN_FRAME_TGT_HANDLE);
-   vrend_video_begin_frame(vctx, cdc_handle, tgt_handle);
-
-   return 0;
+   return vrend_video_begin_frame(vctx, cdc_handle, tgt_handle) ? EINVAL : 0;
 }
 
 static int vrend_decode_decode_bitstream(struct vrend_context *ctx,
@@ -1875,6 +1879,8 @@ static int vrend_decode_decode_bitstream(struct vrend_context *ctx,
                                          uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_DECODE_BS_MIN_SIZE)
       return EINVAL;
@@ -1885,10 +1891,8 @@ static int vrend_decode_decode_bitstream(struct vrend_context *ctx,
    uint32_t buf_handle = get_buf_entry(buf, VIRGL_DECODE_BS_BUF_HANDLE);
    uint32_t buf_size   = get_buf_entry(buf, VIRGL_DECODE_BS_BUF_SIZE);
 
-   vrend_video_decode_bitstream(vctx, cdc_handle, tgt_handle,
-                                dsc_handle, 1, &buf_handle, &buf_size);
-
-   return 0;
+   return vrend_video_decode_bitstream(vctx, cdc_handle, tgt_handle,
+                                dsc_handle, 1, &buf_handle, &buf_size) ? EINVAL : 0;
 }
 
 static int vrend_decode_encode_bitstream(struct vrend_context *ctx,
@@ -1896,6 +1900,8 @@ static int vrend_decode_encode_bitstream(struct vrend_context *ctx,
                                          uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_ENCODE_BS_MIN_SIZE)
       return EINVAL;
@@ -1906,10 +1912,8 @@ static int vrend_decode_encode_bitstream(struct vrend_context *ctx,
    uint32_t desc_handle = get_buf_entry(buf, VIRGL_ENCODE_BS_DESC_HANDLE);
    uint32_t feed_handle = get_buf_entry(buf, VIRGL_ENCODE_BS_FEED_HANDLE);
 
-   vrend_video_encode_bitstream(vctx, cdc_handle, src_handle, dest_handle,
-                                desc_handle, feed_handle);
-
-   return 0;
+   return vrend_video_encode_bitstream(vctx, cdc_handle, src_handle, dest_handle,
+                                desc_handle, feed_handle) ? EINVAL : 0;
 }
 
 static int vrend_decode_end_frame(struct vrend_context *ctx,
@@ -1917,6 +1921,8 @@ static int vrend_decode_end_frame(struct vrend_context *ctx,
                                   uint32_t length)
 {
    struct vrend_video_context *vctx = vrend_context_get_video_ctx(ctx);
+   if (!vctx || !vrend_hw_switch_context(ctx, true))
+      return EINVAL;
 
    if (length < VIRGL_END_FRAME_MIN_SIZE)
       return EINVAL;
@@ -1924,9 +1930,7 @@ static int vrend_decode_end_frame(struct vrend_context *ctx,
    uint32_t cdc_handle = get_buf_entry(buf, VIRGL_END_FRAME_CDC_HANDLE);
    uint32_t tgt_handle = get_buf_entry(buf, VIRGL_END_FRAME_TGT_HANDLE);
 
-   vrend_video_end_frame(vctx, cdc_handle, tgt_handle);
-
-   return 0;
+   return vrend_video_end_frame(vctx, cdc_handle, tgt_handle) ? EINVAL : 0;
 }
 
 #else
