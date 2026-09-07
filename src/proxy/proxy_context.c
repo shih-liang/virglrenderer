@@ -495,7 +495,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
 #ifdef ENABLE_METAL
    if (res_fd_type == VIRGL_RESOURCE_FD_INVALID && res->pipe_resource &&
        !(proxy_renderer.flags & VIRGL_RENDERER_RENDER_SERVER)) {
-      metal_resource = vrend_renderer_resource_metal_texture(res->pipe_resource);
+      metal_resource = res->native_metal_texture;
       if (metal_resource) {
          res_fd_type = VIRGL_RESOURCE_METAL_TEXTURE;
          res_size = virgl_metal_texture_size(metal_resource);

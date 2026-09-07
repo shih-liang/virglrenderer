@@ -12,6 +12,9 @@ typedef void *MTLTexture_id;
 typedef void *MTLHeap_id;
 typedef void *MTLBuffer_id;
 
+/* Whether the native allocator/export path has a Metal format mapping. */
+bool virgl_metal_format_supported(uint32_t format);
+
 struct vrend_metal_texture_description {
    unsigned width;
    unsigned height;

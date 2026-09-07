@@ -21,7 +21,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  *
  **************************************************************************/
-#include <epoxy/gl.h>
+#include "vrend/vrend_gl.h"
 
 #include "vrend_renderer.h"
 #include "util/u_memory.h"
@@ -377,7 +377,7 @@ static bool color_format_can_readback(struct vrend_format_table *virgl_format, i
        return true;
 
    if ((virgl_format->format == VIRGL_FORMAT_R32G32B32A32_FLOAT) &&
-       (gles_ver >= 32 || epoxy_has_gl_extension("GL_EXT_color_buffer_float")))
+       (gles_ver >= 32 || vrend_has_gl_extension("GL_EXT_color_buffer_float")))
       return true;
 
    /* Hotfix for the CI, on GLES these formats are defined like
@@ -406,17 +406,17 @@ static bool depth_stencil_formats_can_readback(enum virgl_formats format)
    case VIRGL_FORMAT_Z32_UNORM:
    case VIRGL_FORMAT_Z32_FLOAT:
    case VIRGL_FORMAT_Z24X8_UNORM:
-      return epoxy_has_gl_extension("GL_NV_read_depth");
+      return vrend_has_gl_extension("GL_NV_read_depth");
 
    case VIRGL_FORMAT_Z24_UNORM_S8_UINT:
    case VIRGL_FORMAT_S8_UINT_Z24_UNORM:
    case VIRGL_FORMAT_Z32_FLOAT_S8X24_UINT:
-      return epoxy_has_gl_extension("GL_NV_read_depth_stencil");
+      return vrend_has_gl_extension("GL_NV_read_depth_stencil");
 
    case VIRGL_FORMAT_X24S8_UINT:
    case VIRGL_FORMAT_S8X24_UINT:
    case VIRGL_FORMAT_S8_UINT:
-      return epoxy_has_gl_extension("GL_NV_read_stencil");
+      return vrend_has_gl_extension("GL_NV_read_stencil");
 
    default:
       return false;
@@ -427,8 +427,8 @@ static void vrend_add_formats(struct vrend_format_table *table, int num_entries)
 {
   int i;
 
-  const bool is_desktop_gl = epoxy_is_desktop_gl();
-  const int gles_ver = is_desktop_gl ? 0 : epoxy_gl_version();
+  const bool is_desktop_gl = vrend_is_desktop_gl();
+  const int gles_ver = is_desktop_gl ? 0 : vrend_gl_version();
 
   for (i = 0; i < num_entries; i++) {
     GLenum status;
@@ -523,7 +523,7 @@ static void vrend_add_formats(struct vrend_format_table *table, int num_entries)
 
 static void vrend_add_compressed_formats(struct vrend_format_table *table, int num_entries)
 {
-   int flags = epoxy_is_desktop_gl() ? VIRGL_TEXTURE_CAN_READBACK : 0;
+   int flags = vrend_is_desktop_gl() ? VIRGL_TEXTURE_CAN_READBACK : 0;
    for (int i = 0; i < num_entries; i++) {
       vrend_insert_format(&table[i], VIRGL_BIND_SAMPLER_VIEW, flags);
    }
@@ -562,19 +562,19 @@ void vrend_build_format_list_common(void)
   add_formats(snorm_la_formats);
 
   /* compressed */
-  if (epoxy_has_gl_extension("GL_S3_s3tc") ||
-      epoxy_has_gl_extension("GL_EXT_texture_compression_s3tc") ||
-      epoxy_has_gl_extension("GL_ANGLE_texture_compression_dxt")) {
+  if (vrend_has_gl_extension("GL_S3_s3tc") ||
+      vrend_has_gl_extension("GL_EXT_texture_compression_s3tc") ||
+      vrend_has_gl_extension("GL_ANGLE_texture_compression_dxt")) {
      add_compressed_formats(dxtn_formats);
      add_compressed_formats(dxtn_srgb_formats);
   }
 
-  if (epoxy_has_gl_extension("GL_ARB_texture_compression_rgtc") ||
-      epoxy_has_gl_extension("GL_EXT_texture_compression_rgtc") )
+  if (vrend_has_gl_extension("GL_ARB_texture_compression_rgtc") ||
+      vrend_has_gl_extension("GL_EXT_texture_compression_rgtc") )
      add_compressed_formats(rgtc_formats);
 
-  if (epoxy_has_gl_extension("GL_ARB_texture_compression_bptc") ||
-      epoxy_has_gl_extension("GL_EXT_texture_compression_bptc"))
+  if (vrend_has_gl_extension("GL_ARB_texture_compression_bptc") ||
+      vrend_has_gl_extension("GL_EXT_texture_compression_bptc"))
      add_compressed_formats(bptc_formats);
 
   add_formats(srgb_formats);
@@ -615,10 +615,10 @@ void vrend_build_format_list_gles(void)
   add_formats(gles_z32_format);
   add_formats(gles_bit10_formats);
 
-  if (epoxy_has_gl_extension("GL_KHR_texture_compression_astc_ldr"))
+  if (vrend_has_gl_extension("GL_KHR_texture_compression_astc_ldr"))
      add_compressed_formats(astc_formats);
 
-  if (epoxy_gl_version() >= 30) {
+  if (vrend_gl_version() >= 30) {
      add_compressed_formats(etc2_formats);
   }
 
@@ -648,7 +648,7 @@ void vrend_check_texture_storage(struct vrend_format_table *table)
 void vrend_check_texture_multisample(struct vrend_format_table *table,
                                      bool enable_storage)
 {
-   bool is_desktop_gl = epoxy_is_desktop_gl();
+   bool is_desktop_gl = vrend_is_desktop_gl();
    for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
       bool function_available =
          (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) ? enable_storage : is_desktop_gl;
@@ -662,10 +662,13 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
          if (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) {
             glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
                                       table[i].internalformat, 32, 32, GL_TRUE);
-         } else {
+         }
+#ifndef ENABLE_ANGLE
+         else {
             glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
                                     table[i].internalformat, 32, 32, GL_TRUE);
          }
+#endif
          if (glGetError() == GL_NO_ERROR)
             table[i].flags |= VIRGL_TEXTURE_CAN_MULTISAMPLE;
          glDeleteTextures(1, &tex_id);
@@ -716,18 +719,8 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
    assert(glGetError() == GL_NO_ERROR &&
           "Stale error state detected, please check for failures in initialization");
 
-   /* glTexStorage2DMultisample availability check with graceful downgrade:
-    * 
-    * glTexStorage2DMultisample requires:
-    *   - OpenGL 4.3+ or GL_ARB_texture_storage_multisample (desktop GL)
-    *   - OpenGL ES 3.1+ (mobile/ANGLE)
-    * 
-    * Fallback alternatives available on older versions:
-    *   - glTexImage2DMultisample: GL 3.2+ / ES 3.1+ (works on GL 4.1 Core)
-    *   - glRenderbufferStorageMultisample: GL 3.0+ / ES 3.0+ (works on ANGLE)
-    * 
-    * We'll use glTexStorage2DMultisample if available, otherwise fall back to
-    * glTexImage2DMultisample for proper MSAA capability testing. */
+   /* GLES 3.1 has multisample texture storage; GLES 3.0 uses renderbuffers.
+    * glTexImage2DMultisample is desktop GL only. */
    
    const char *renderer = (const char *)glGetString(GL_RENDERER);
    const char *version_str = (const char *)glGetString(GL_VERSION);
@@ -737,29 +730,31 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
    bool has_tex_image_ms = false;
    bool has_rbo_storage_ms = false;
    
-   if (epoxy_is_desktop_gl()) {
+#ifndef ENABLE_ANGLE
+   if (vrend_is_desktop_gl()) {
       /* Desktop OpenGL path */
-      if (epoxy_gl_version() >= 43) {
+      if (vrend_gl_version() >= 43) {
          has_tex_storage_ms = true;
-      } else if (epoxy_has_gl_extension("GL_ARB_texture_storage_multisample")) {
+      } else if (vrend_has_gl_extension("GL_ARB_texture_storage_multisample")) {
          has_tex_storage_ms = true;
       }
       /* glTexImage2DMultisample available since GL 3.2 */
-      if (epoxy_gl_version() >= 32) {
+      if (vrend_gl_version() >= 32) {
          has_tex_image_ms = true;
       }
       /* glRenderbufferStorageMultisample available since GL 3.0 */
-      if (epoxy_gl_version() >= 30) {
+      if (vrend_gl_version() >= 30) {
          has_rbo_storage_ms = true;
       }
-   } else {
+   } else
+#endif
+   {
       /* OpenGL ES path */
-      if (epoxy_gl_version() >= 31) {
+      if (vrend_gl_version() >= 31) {
          has_tex_storage_ms = true;
-         has_tex_image_ms = true;
       }
       /* glRenderbufferStorageMultisample available since ES 3.0 (ANGLE/Metal) */
-      if (epoxy_gl_version() >= 30) {
+      if (vrend_gl_version() >= 30) {
          has_rbo_storage_ms = true;
       }
    }
@@ -771,7 +766,7 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
                   "Disabling MSAA support.\n", 
                   version_str ? version_str : "unknown",
                   renderer ? renderer : "unknown",
-                  epoxy_is_desktop_gl());
+                  vrend_is_desktop_gl());
       memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));
       return 0;  /* Return 0 to indicate MSAA not supported */
    }
@@ -815,9 +810,12 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
          
          if (has_tex_storage_ms) {
             glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA8, 64, 64, GL_TRUE);
-         } else {
+         }
+#ifndef ENABLE_ANGLE
+         else {
             glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA8, 64, 64, GL_TRUE);
          }
+#endif
          GLenum err3 = glGetError();
          
          if (err1 != GL_NO_ERROR || err2 != GL_NO_ERROR || err3 != GL_NO_ERROR) {
@@ -851,7 +849,7 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
                max_samples_confirmed = test_num_samples[i];
 
             /* glGetMultisamplefv only available in desktop GL (since 3.2), not in GL ES */
-            if (epoxy_is_desktop_gl()) {
+            if (vrend_is_desktop_gl()) {
                for (unsigned k = 0; k < test_num_samples[i]; ++k) {
                   float msp[2];
                   uint32_t compressed;
@@ -951,7 +949,7 @@ static int format_uncompressed_compressed_copy_compatible(enum virgl_formats src
       case VIRGL_FORMAT_ASTC_10x10_SRGB:
       case VIRGL_FORMAT_ASTC_12x10_SRGB:
       case VIRGL_FORMAT_ASTC_12x12_SRGB:
-         return epoxy_is_desktop_gl() ? -1 : 1;
+         return vrend_is_desktop_gl() ? -1 : 1;
       default:
          return -1;
       }
@@ -989,7 +987,7 @@ static int format_uncompressed_compressed_copy_compatible(enum virgl_formats src
 
 static bool format_compressed_compressed_copy_compatible(enum virgl_formats src, enum virgl_formats dst)
 {
-   const bool is_desktop_gl = epoxy_is_desktop_gl();
+   const bool is_desktop_gl = vrend_is_desktop_gl();
 
    if(!is_desktop_gl) {
       if((src == VIRGL_FORMAT_ASTC_4x4 && dst == VIRGL_FORMAT_ASTC_4x4_SRGB) ||

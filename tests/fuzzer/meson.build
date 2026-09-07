@@ -29,7 +29,7 @@ virgl_fuzzer = executable(
    'virgl_fuzzer.c',
    c_args : [ '-fsanitize=fuzzer' ],
    link_args : [ '-fsanitize=fuzzer' ],
-   dependencies : [libvirglrenderer_dep, gallium_dep, epoxy_dep]
+   dependencies : [libvirglrenderer_dep, gallium_dep, gl_dep, egl_dep]
 )
 
 virgl_fuzzer_from_states = executable(
@@ -38,7 +38,7 @@ virgl_fuzzer_from_states = executable(
    c_args : [ '-fsanitize=fuzzer' ],
    link_args : [ '-fsanitize=fuzzer' ],
    link_with: libvrtest,
-   dependencies : [libvirglrenderer_dep, gallium_dep, epoxy_dep]
+   dependencies : [libvirglrenderer_dep, gallium_dep, gl_dep, egl_dep]
 )
 
 

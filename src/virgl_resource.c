@@ -63,6 +63,8 @@ virgl_resource_destroy_func(void *val)
       close(res->fd);
 
 	virgl_resource_metal_texture_state_release(res->metal_texture_state);
+   if (res->native_metal_texture)
+      CFRelease(res->native_metal_texture);
 
    free(res);
 }
@@ -149,6 +151,10 @@ virgl_resource_create_from_pipe(uint32_t res_id,
 
    /* take ownership */
    res->pipe_resource = pres;
+   if (pipe_callbacks.get_metal_texture) {
+      res->native_metal_texture = pipe_callbacks.get_metal_texture(pres);
+      if (res->native_metal_texture) CFRetain(res->native_metal_texture);
+   }
 
    res->iov = iov;
    res->iov_count = iov_count;

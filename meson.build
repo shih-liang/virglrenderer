@@ -82,13 +82,20 @@ prog_python = import('python').find_installation('python3')
 not_found = dependency('', required: false)
 gbm_dep = not_found
 thread_dep = dependency('threads')
-epoxy_dep = dependency('epoxy', version: '>= 1.5.4')
+if host_machine.system() == 'darwin'
+   gl_dep = dependency('angle', static: true)
+   egl_dep = gl_dep
+else
+   gl_dep = dependency('gl')
+   egl_dep = dependency('egl')
+endif
 m_dep = cc.find_library('m', required : false)
 all_languages = ['c']
 
 conf_data = configuration_data()
 conf_data.set('VERSION', meson.project_version())
 conf_data.set('_GNU_SOURCE', 1)
+conf_data.set('ENABLE_ANGLE', host_machine.system() == 'darwin')
 # Compile unstable APIs unconditionally to avoid building two variants of
 # the lib. It's up to virglrenderer users to decide whether to use these
 # APIs. Unstable APIs may be changed or removed without a notice.
@@ -289,7 +296,7 @@ have_egl = false
 have_glx = false
 
 if with_egl
-   if cc.has_header('epoxy/egl.h', dependencies: epoxy_dep) and epoxy_dep.get_variable(pkgconfig: 'epoxy_has_egl') == '1'
+   if cc.has_header('EGL/egl.h', dependencies: egl_dep)
       if with_host_windows or with_host_darwin
          have_egl = true
       else
@@ -303,21 +310,21 @@ if with_egl
             conf_data.set('ENABLE_GBM_ALLOCATION', 1)
          endif
       endif
-      conf_data.set('HAVE_EPOXY_EGL_H', have_egl)
+      conf_data.set('HAVE_EGL', have_egl)
    else
       assert(not require_egl,
-             'egl was explicitely requested but it is not supported by epoxy')
+             'EGL headers are required')
    endif
 endif
 
 if with_glx
-   if cc.has_header('epoxy/glx.h', dependencies: epoxy_dep) and epoxy_dep.get_variable(pkgconfig: 'epoxy_has_glx') == '1'
+   if not with_host_darwin and cc.has_header('GL/glx.h', dependencies: gl_dep)
       glx_dep = dependency('x11', required: require_glx)
       have_glx = glx_dep.found()
-      conf_data.set('HAVE_EPOXY_GLX_H', 1)
+      conf_data.set('HAVE_GLX', 1)
    else
       assert(not require_glx,
-             'glx was explicitely requested but it is not supported by epoxy')
+             'GLX is unavailable with this renderer SDK')
    endif
 endif
 

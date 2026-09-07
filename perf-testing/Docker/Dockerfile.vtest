@@ -29,7 +29,9 @@ RUN apt-get update && apt-get install -y \
     libgbm-dev \
     libdw-dev \
     libelf-dev \
-    libepoxy-dev \
+    libegl-dev \
+    libgl-dev \
+    libgles-dev \
     libgtest-dev \
     libkmod-dev \
     libllvmspirvlib-18-dev \

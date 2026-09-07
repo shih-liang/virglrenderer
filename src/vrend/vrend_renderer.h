@@ -38,7 +38,7 @@
 #define VIRGL_GBM_MAX_PLANES 4
 #endif
 #include "virgl_hw.h"
-#include <epoxy/gl.h>
+#include "vrend/vrend_gl.h"
 #ifdef WIN32
 #include <d3d11.h>
 #endif

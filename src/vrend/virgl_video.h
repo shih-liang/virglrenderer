@@ -82,6 +82,10 @@ struct virgl_video_create_buffer_args {
 struct virgl_video_dma_buf {
     struct virgl_video_buffer *buf;
 
+    /* Native backend frame, borrowed for the callback. On macOS this is a
+     * CVPixelBuffer, not a Linux dma-buf fd and not a CPU pixel mapping. */
+    void *native_frame;
+
     uint32_t drm_format;
     uint32_t width;
     uint32_t height;
@@ -146,6 +150,15 @@ void *virgl_video_codec_opaque_data(struct virgl_video_codec *codec);
 
 struct virgl_video_buffer *virgl_video_create_buffer(
         const struct virgl_video_create_buffer_args *args);
+#ifdef __APPLE__
+/* Accepted frames call completion exactly once (possibly before return).
+ * pixels is a borrowed CVPixelBuffer, or NULL on decode failure. No codec or
+ * video-buffer pointer is used by the callback after submission. */
+typedef void (*virgl_video_decode_done)(void *data, void *pixels);
+int virgl_video_end_frame_async(struct virgl_video_codec *codec,
+                               struct virgl_video_buffer *target,
+                               virgl_video_decode_done completion, void *data);
+#endif
 void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer);
 uint32_t virgl_video_buffer_id(const struct virgl_video_buffer *buffer);
 void *virgl_video_buffer_opaque_data(struct virgl_video_buffer *buffer);

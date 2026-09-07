@@ -30,8 +30,9 @@
 #mesondefine HAVE_PTHREAD
 #mesondefine HAVE_PTHREAD_SETAFFINITY
 #mesondefine HAVE_PTHREAD_NP_H
-#mesondefine HAVE_EPOXY_EGL_H
-#mesondefine HAVE_EPOXY_GLX_H
+#mesondefine HAVE_EGL
+#mesondefine ENABLE_ANGLE
+#mesondefine HAVE_GLX
 #mesondefine CHECK_GL_ERRORS
 #mesondefine ENABLE_GBM_ALLOCATION
 #mesondefine ENABLE_VENUS

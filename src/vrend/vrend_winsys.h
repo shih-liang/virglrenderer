@@ -30,7 +30,7 @@
 #ifdef ENABLE_GBM
 #include "vrend_winsys_gbm.h"
 #endif
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
 #include "vrend_winsys_egl.h"
 #endif
 
@@ -42,7 +42,7 @@
 
 struct virgl_gl_ctx_param;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
 extern struct virgl_egl *egl;
 extern struct virgl_gbm *gbm;
 #endif

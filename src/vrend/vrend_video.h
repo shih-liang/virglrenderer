@@ -40,6 +40,9 @@
 #define VREND_VIDEO_BUFFER_PLANE_NUM  3
 
 struct vrend_video_context;
+#ifdef __APPLE__
+bool vrend_video_failed(struct vrend_video_context *ctx);
+#endif
 
 int vrend_video_init(int drm_fd);
 void vrend_video_fini(void);

@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <epoxy/egl.h>
+#include "vrend/vrend_gl.h"
 
 #include "util/bitscan.h"
 #include "util/macros.h"

@@ -73,6 +73,12 @@
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
 #include "vrend_video.h"
+#ifdef __APPLE__
+#include "virgl_resource.h"
+#include "virgl_video_metal.h"
+#include <CoreFoundation/CoreFoundation.h>
+#include <EGL/eglext_angle.h>
+#endif
 
 #define VREND_VIDEO_FOURCC(a, b, c, d) \
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
@@ -84,11 +90,15 @@ struct vrend_video_context {
     struct vrend_context *ctx;
     struct list_head codecs;
     struct list_head buffers;
+#ifdef __APPLE__
+    struct virgl_video_metal *metal;
+#endif
 };
 
 struct vrend_video_codec {
     struct virgl_video_codec *codec;
     uint32_t handle;
+    uint32_t entrypoint;
     uint32_t feed_handle;    /* Look up again at completion: resources may detach. */
     uint32_t dest_handle;
     struct vrend_video_context *ctx;
@@ -97,14 +107,20 @@ struct vrend_video_codec {
 
 struct vrend_video_plane {
     uint32_t res_handle;
+#ifdef __APPLE__
+    void *native_texture;
+#else
     GLuint texture;         /* texture for temporary use */
     EGLImageKHR egl_image;  /* egl image for temporary use */
+#endif
 };
 
 struct vrend_video_buffer {
     struct virgl_video_buffer *buffer;
 
     uint32_t handle;
+    uint32_t format;
+    uint32_t width, height;
     struct vrend_video_context *ctx;
     struct list_head head;
 
@@ -149,6 +165,73 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
+#ifdef __APPLE__
+/* GL is an importer of the shared resource. Bridge only its execution
+ * dependency; the codec and the actual plane transfer never call GL/EGL. */
+static struct virgl_video_metal_fence *prepare_video_planes(
+    struct vrend_video_buffer *buf, bool download)
+{
+    bool p010 = buf->format == PIPE_FORMAT_P010;
+    struct vrend_video_context *ctx = buf->ctx;
+    void *textures[3] = {buf->planes[0].native_texture, buf->planes[1].native_texture,
+                         buf->planes[2].native_texture};
+    if (buf->format == PIPE_FORMAT_YV12) {
+        textures[1] = buf->planes[2].native_texture;
+        textures[2] = buf->planes[1].native_texture;
+    }
+    if (!ctx->metal) ctx->metal = virgl_video_metal_create(textures[0]);
+    if (!ctx->metal)
+        return NULL;
+
+    EGLDisplay display = eglGetCurrentDisplay();
+    PFNEGLCOPYMETALSHAREDEVENTANGLEPROC copy_event =
+        (PFNEGLCOPYMETALSHAREDEVENTANGLEPROC)eglGetProcAddress("eglCopyMetalSharedEventANGLE");
+    if (!copy_event) return NULL;
+    const EGLAttrib before_attrs[] = {
+        EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_LO_ANGLE, 1,
+        EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_HI_ANGLE, 0, EGL_NONE};
+    EGLSync before = eglCreateSync(display, EGL_SYNC_METAL_SHARED_EVENT_ANGLE, before_attrs);
+    if (before == EGL_NO_SYNC) return NULL;
+    void *event = copy_event(display, before);
+    glFlush();
+    eglDestroySync(display, before);
+    if (!event) return NULL;
+    struct virgl_video_metal_fence *copy = virgl_video_metal_prepare(
+        ctx->metal, textures, buf->num_planes, buf->width, buf->height, p010, download, event, 1);
+    CFRelease(event);
+    return copy;
+}
+
+bool vrend_video_failed(struct vrend_video_context *ctx)
+{
+    return ctx && virgl_video_metal_failed(ctx->metal);
+}
+
+static void decoded_async(void *data, void *pixels)
+{
+    /* Runs on VT's callback thread. No GL, context or mutable resource lookup. */
+    struct virgl_video_metal_fence *fence = data;
+    virgl_video_metal_complete(fence, pixels);
+    virgl_video_metal_fence_unref(fence);
+}
+
+static int sync_video_planes(struct vrend_video_buffer *buf,
+                             const struct virgl_video_dma_buf *frame,
+                             bool download)
+{
+    /* Encoding is a CPU API consumer of the input CVPixelBuffer. Decode uses
+     * the asynchronous callback below and never enters this waiting path. */
+    uint32_t required = download ? VIRGL_VIDEO_DMABUF_READ_ONLY : VIRGL_VIDEO_DMABUF_WRITE_ONLY;
+    if (!frame || !frame->native_frame || !(frame->flags & required)) return -1;
+    struct virgl_video_metal_fence *copy = prepare_video_planes(buf, download);
+    if (!copy) return -1;
+    virgl_video_metal_complete(copy, frame->native_frame);
+    int result = virgl_video_metal_fence_wait(copy, true);
+    virgl_video_metal_fence_unref(copy);
+    return result == 1 ? 0 : -1;
+}
+
+#else
 /* Video transfers share the guest's GL context. Preserve real GL state so the
  * renderer's cached bindings remain valid, including PBOs and pixel offsets. */
 static int sync_video_planes(struct vrend_video_buffer *buf,
@@ -262,6 +345,7 @@ out:
         glPixelStorei(stores[i], previous[i]);
     return result;
 }
+#endif
 
 static int vrend_video_decode_completed(struct virgl_video_codec *codec,
                                         const struct virgl_video_dma_buf *dmabuf)
@@ -380,7 +464,8 @@ int vrend_video_create_codec(struct vrend_video_context *ctx,
         entrypoint > PIPE_VIDEO_ENTRYPOINT_ENCODE)
         return -1;
 
-    if (chroma_format >= PIPE_VIDEO_CHROMA_FORMAT_NONE)
+    if (chroma_format == PIPE_VIDEO_CHROMA_FORMAT_NONE ||
+        chroma_format > PIPE_VIDEO_CHROMA_FORMAT_444)
         return -1;
 
     if (!width || !height)
@@ -406,6 +491,7 @@ int vrend_video_create_codec(struct vrend_video_context *ctx,
     }
 
     cdc->handle = handle;
+    cdc->entrypoint = entrypoint;
     cdc->ctx = ctx;
     list_add(&cdc->head, &ctx->codecs);
 
@@ -468,8 +554,10 @@ int vrend_video_create_buffer(struct vrend_video_context *ctx,
         return -1;
     }
 
+#ifndef __APPLE__
     for (i = 0; i < ARRAY_SIZE(buf->planes); i++)
         buf->planes[i].egl_image = EGL_NO_IMAGE_KHR;
+#endif
 
     for (i = 0, buf->num_planes = 0;
          i < num_res && buf->num_planes < ARRAY_SIZE(buf->planes); i++) {
@@ -479,14 +567,49 @@ int vrend_video_create_buffer(struct vrend_video_context *ctx,
 
         plane = &buf->planes[buf->num_planes++];
         plane->res_handle = res_handles[i];
+#ifdef __APPLE__
+        struct virgl_resource *resource = virgl_resource_lookup(res_handles[i]);
+        struct vrend_resource *view = vrend_renderer_ctx_res_lookup(ctx->ctx, res_handles[i]);
+        unsigned p = buf->num_planes - 1;
+        bool p010 = format == PIPE_FORMAT_P010;
+        bool planar = format == PIPE_FORMAT_IYUV || format == PIPE_FORMAT_YV12;
+        unsigned expected = p010 ? (p ? PIPE_FORMAT_R16G16_UNORM : PIPE_FORMAT_R16_UNORM)
+                                 : (p && !planar ? PIPE_FORMAT_R8G8_UNORM : PIPE_FORMAT_R8_UNORM);
+        unsigned shift = p != 0;
+        if ((!p010 && !planar && format != PIPE_FORMAT_NV12) ||
+            p >= (planar ? 3u : 2u) || !view || !resource ||
+            !resource->native_metal_texture || view->base.format != expected ||
+            view->base.width0 < (((uint64_t)width + shift) >> shift) ||
+            view->base.height0 < (((uint64_t)height + shift) >> shift))
+            goto fail_planes;
+        plane->native_texture = (void *)CFRetain(resource->native_metal_texture);
+#else
         glGenTextures(1, &plane->texture);
+#endif
     }
+#ifdef __APPLE__
+    if (buf->num_planes != ((format == PIPE_FORMAT_IYUV || format == PIPE_FORMAT_YV12) ? 3u : 2u))
+        goto fail_planes;
+#endif
 
     buf->handle = handle;
+    buf->format = format;
+    buf->width = width;
+    buf->height = height;
     buf->ctx = ctx;
     list_add(&buf->head, &ctx->buffers);
 
     return 0;
+#ifdef __APPLE__
+fail_planes:
+    virgl_error("video buffer %u: incompatible native planes for format %u (%ux%u, %u planes)\n",
+                handle, format, width, height, buf->num_planes);
+    for (i = 0; i < buf->num_planes; i++)
+        if (buf->planes[i].native_texture) CFRelease(buf->planes[i].native_texture);
+    virgl_video_destroy_buffer(buf->buffer);
+    free(buf);
+    return -1;
+#endif
 }
 
 static void destroy_video_buffer(struct vrend_video_buffer *buf)
@@ -502,9 +625,13 @@ static void destroy_video_buffer(struct vrend_video_buffer *buf)
     for (i = 0; i < buf->num_planes; i++) {
         plane = &buf->planes[i];
 
+#ifdef __APPLE__
+        if (plane->native_texture) CFRelease(plane->native_texture);
+#else
         glDeleteTextures(1, &plane->texture);
         if (plane->egl_image != EGL_NO_IMAGE_KHR)
             eglDestroyImageKHR(eglGetCurrentDisplay(), plane->egl_image);
+#endif
     }
 
     virgl_video_destroy_buffer(buf->buffer);
@@ -543,6 +670,10 @@ void vrend_video_destroy_context(struct vrend_video_context *ctx)
 
    list_for_each_entry_safe(struct vrend_video_buffer, vbuf, &ctx->buffers, head)
       destroy_video_buffer(vbuf);
+
+#ifdef __APPLE__
+   virgl_video_metal_destroy(ctx->metal);
+#endif
 
    free(ctx);
 }
@@ -836,5 +967,27 @@ int vrend_video_end_frame(struct vrend_video_context *ctx,
     if (!cdc || !tgt)
         return -1;
 
+#ifdef __APPLE__
+    if (cdc->entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM) {
+        for (unsigned p = 0; p < tgt->num_planes; p++) {
+            struct virgl_resource *resource = virgl_resource_lookup(tgt->planes[p].res_handle);
+            struct vrend_resource *plane = vrend_renderer_ctx_res_lookup(ctx->ctx, tgt->planes[p].res_handle);
+            if (!resource || !plane || resource->native_metal_texture != tgt->planes[p].native_texture)
+                return -1;
+        }
+        struct virgl_video_metal_fence *fence = prepare_video_planes(tgt, true);
+        if (!fence) return -1;
+        virgl_video_metal_fence_ref(fence); /* Callback owns this reference. */
+        int result = virgl_video_end_frame_async(cdc->codec, tgt->buffer,
+                                                 decoded_async, fence);
+        if (result) decoded_async(fence, NULL);
+        /* Match upstream END_FRAME: decoded pixels must reach the fixed
+         * planes before dispatch proceeds. Wait for native completion here,
+         * not for the VirGL submission fence created after this returns. */
+        bool completed = virgl_video_metal_fence_wait(fence, true) > 0;
+        virgl_video_metal_fence_unref(fence);
+        return result ? result : (completed ? 0 : -1);
+    }
+#endif
     return virgl_video_end_frame(cdc->codec, tgt->buffer);
 }

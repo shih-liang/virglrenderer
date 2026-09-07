@@ -27,7 +27,7 @@
 #include "virglrenderer.h"
 #include "vrend_renderer.h"
 
-#include <epoxy/egl.h>
+#include "vrend/vrend_gl.h"
 
 #ifdef WIN32
 #include <d3d11.h>

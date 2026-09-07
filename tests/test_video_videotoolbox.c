@@ -1,6 +1,7 @@
 /* Standalone parser/lifetime and hardware round-trip tests. No guest required. */
 #include "vrend/virgl_video_videotoolbox.c"
 #include <stdio.h>
+#include <dispatch/dispatch.h>
 
 static unsigned checks, failures, frame_value, decoded_frames;
 static bool upload_failure, download_failure;
@@ -9,10 +10,15 @@ static struct byte_buffer encoded;
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); failures++; \
 } } while (0)
 
-static int upload(struct virgl_video_codec *codec, const struct virgl_video_dma_buf *mapping)
+static int upload(struct virgl_video_codec *codec, const struct virgl_video_dma_buf *frame)
 {
     (void)codec;
     if (upload_failure) return -1;
+    struct virgl_video_dma_buf mapped = *frame;
+    const struct virgl_video_dma_buf *mapping = &mapped;
+    if (CVPixelBufferLockBaseAddress(frame->native_frame, 0)) return -1;
+    for (unsigned p = 0; p < 2; p++)
+        mapped.planes[p].data = CVPixelBufferGetBaseAddressOfPlane(frame->native_frame, p);
     for (unsigned plane = 0; plane < 2; plane++) {
         bool p010 = mapping->drm_format == DRM_FORMAT_P010;
         unsigned value = plane ? 128 : frame_value;
@@ -25,16 +31,22 @@ static int upload(struct virgl_video_codec *codec, const struct virgl_video_dma_
             else memset(bytes, value, components);
         }
     }
+    CVPixelBufferUnlockBaseAddress(frame->native_frame, 0);
     return 0;
 }
-static int decoded(struct virgl_video_codec *codec, const struct virgl_video_dma_buf *mapping)
+static int decoded(struct virgl_video_codec *codec, const struct virgl_video_dma_buf *frame)
 {
     (void)codec;
     decoded_frames++;
+    struct virgl_video_dma_buf mapped = *frame;
+    const struct virgl_video_dma_buf *mapping = &mapped;
+    if (CVPixelBufferLockBaseAddress(frame->native_frame, kCVPixelBufferLock_ReadOnly)) return -1;
+    mapped.planes[0].data = CVPixelBufferGetBaseAddressOfPlane(frame->native_frame, 0);
     unsigned value = mapping->drm_format == DRM_FORMAT_P010 ?
         (*(const uint16_t *)mapping->planes[0].data >> 8) :
         *(const uint8_t *)mapping->planes[0].data;
     CHECK(abs((int)value - (int)frame_value) <= 3);
+    CVPixelBufferUnlockBaseAddress(frame->native_frame, kCVPixelBufferLock_ReadOnly);
     return download_failure ? -1 : 0;
 }
 static int coded(struct virgl_video_codec *codec,
@@ -47,6 +59,12 @@ static int coded(struct virgl_video_codec *codec,
     for (unsigned i = 0; i < count; i++)
         if (!bb_append(&encoded, data[i], sizes[i])) return -1;
     return 0;
+}
+
+#include "video_decode_test.h"
+static int test_decode_frame(struct virgl_video_codec *codec, struct virgl_video_buffer *target)
+{
+    return test_decode_wait(codec, target, NULL, decoded);
 }
 
 static void round_trip(enum pipe_video_profile profile)
@@ -73,7 +91,7 @@ static void round_trip(enum pipe_video_profile profile)
     CHECK(!source->pixel_buffer && !target->pixel_buffer);
     CHECK(virgl_video_begin_frame(decoder, target) == 0);
     unsigned before = decoded_frames;
-    CHECK(virgl_video_end_frame(decoder, target) != 0);
+    CHECK(test_decode_frame(decoder, target) != 0);
     CHECK(before == decoded_frames);
     upload_failure = true;
     CHECK(virgl_video_begin_frame(encoder, source) != 0);
@@ -112,7 +130,7 @@ static void round_trip(enum pipe_video_profile profile)
         unsigned tail_size = size - split;
         CHECK(virgl_video_decode_bitstream(decoder, target, &decode_picture, 1, &tail, &tail_size) == 0);
         download_failure = frame == 9;
-        CHECK((virgl_video_end_frame(decoder, target) == 0) == !download_failure);
+        CHECK((test_decode_frame(decoder, target) == 0) == !download_failure);
         download_failure = false;
         if (!frame) first_session = decoder->decoder;
         CHECK(first_session == decoder->decoder);
@@ -122,7 +140,7 @@ static void round_trip(enum pipe_video_profile profile)
     union virgl_picture_desc picture = {0}; picture.base.profile = profile;
     before = decoded_frames;
     CHECK(virgl_video_decode_bitstream(decoder, target, &picture, 1, &bad, &size) != 0);
-    CHECK(virgl_video_end_frame(decoder, target) != 0);
+    CHECK(test_decode_frame(decoder, target) != 0);
     CHECK(decoded_frames == before);
 out:
     virgl_video_destroy_buffer(target);
@@ -152,10 +170,41 @@ static void parser_tests(void)
         .width = 128, .height = 128, .max_references = 4};
     struct virgl_h265_picture_desc picture = {0};
     picture.pps.sps.chroma_format_idc = 1;
+    picture.pps.sps.pic_width_in_luma_samples = codec.width;
+    picture.pps.sps.pic_height_in_luma_samples = codec.height;
+    picture.pps.sps.log2_diff_max_min_luma_coding_block_size = 3;
     picture.pps.sps.num_short_term_ref_pic_sets = 1;
     struct byte_buffer vps = {0}, sps = {0}, pps = {0};
+    CHECK(synthesize_hevc_parameter_sets(&codec, &picture, 0, &vps, &sps, &pps));
+    CHECK(vps.size && sps.size && pps.size);
+    bb_clear(&vps); bb_clear(&sps); bb_clear(&pps);
+    picture.pps.sps.num_short_term_ref_pic_sets = 65;
     CHECK(!synthesize_hevc_parameter_sets(&codec, &picture, 0, &vps, &sps, &pps));
     CHECK(!vps.size && !sps.size && !pps.size);
+    /* System Mesa's VA frontend fills picture references, leaving the
+     * similarly named SPS/PPS fields zero. Check the emitted syntax. */
+    codec.profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
+    struct virgl_h264_picture_desc h264 = {0};
+    h264.pps.sps.chroma_format_idc = 1;
+    h264.pps.sps.frame_mbs_only_flag = 1;
+    h264.pps.sps.pic_order_cnt_type = 2;
+    h264.num_ref_frames = 3;
+    h264.num_ref_idx_l0_active_minus1 = 2;
+    h264.num_ref_idx_l1_active_minus1 = 1;
+    CHECK(synthesize_h264_parameter_sets(&codec, &h264, 0, &sps, &pps));
+    struct bit_reader reader = {.data = sps.data, .size = sps.size, .byte = 4};
+    CHECK(br_ue(&reader) == 0); /* SPS id */
+    CHECK(br_ue(&reader) == 1); /* 4:2:0 */
+    CHECK(br_ue(&reader) == 0 && br_ue(&reader) == 0); /* 8 bit */
+    CHECK(br_bit(&reader) == 0 && br_bit(&reader) == 0);
+    CHECK(br_ue(&reader) == 0 && br_ue(&reader) == 2);
+    CHECK(br_ue(&reader) == 3 && !reader.failed);
+    reader = (struct bit_reader){.data = pps.data, .size = pps.size, .byte = 1};
+    CHECK(br_ue(&reader) == 0 && br_ue(&reader) == 0);
+    CHECK(br_bit(&reader) == 0 && br_bit(&reader) == 0);
+    CHECK(br_ue(&reader) == 0);
+    CHECK(br_ue(&reader) == 2 && br_ue(&reader) == 1 && !reader.failed);
+    bb_clear(&sps); bb_clear(&pps);
     uint8_t avcc[264]; memset(avcc, 0xaa, sizeof(avcc));
     avcc[0] = avcc[1] = 0; avcc[2] = 1; avcc[3] = 4; /* Length 260, not Annex B. */
     avcc[4] = 0x65; avcc[5] = 0xb8; avcc[263] = 0;
@@ -186,8 +235,7 @@ int main(void)
         printf("capability profile=%u entrypoint=%u\n",
             caps.v2.video_caps[i].profile, caps.v2.video_caps[i].entrypoint);
         CHECK(caps.v2.video_caps[i].entrypoint != PIPE_VIDEO_ENTRYPOINT_BITSTREAM ||
-              (!hevc_profile_supported(caps.v2.video_caps[i].profile) &&
-               caps.v2.video_caps[i].profile != PIPE_VIDEO_PROFILE_AV1_MAIN));
+               caps.v2.video_caps[i].profile != PIPE_VIDEO_PROFILE_AV1_MAIN);
     }
     parser_tests();
     round_trip(PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE);

@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#include <epoxy/gl.h>
+#include "vrend/vrend_gl.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -521,7 +521,7 @@ static int virgl_renderer_resource_get_info_common(int res_handle,
    }
 #elif defined(ENABLE_METAL)
    if (type && handle) {
-      *handle = vrend_renderer_resource_metal_texture(res->pipe_resource);
+      *handle = res->native_metal_texture;
       if (*handle) {
          *type = VIRGL_NATIVE_HANDLE_METAL_TEXTURE;
       }

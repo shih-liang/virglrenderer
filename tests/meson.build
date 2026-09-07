@@ -88,7 +88,7 @@ test('test_virgl_gbm_resources', test_virgl_gbm_resources, is_parallel : false)
 
 fuzzytest_depends = [
    libvirglrenderer_dep,
-   epoxy_dep,
+   gl_dep, egl_dep,
 ]
 
 if with_tracing == 'percetto'

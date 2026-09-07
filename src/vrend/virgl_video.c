@@ -63,8 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <epoxy/gl.h>
-#include <epoxy/egl.h>
+#include "vrend/vrend_gl.h"
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
@@ -131,10 +130,6 @@ static enum pipe_video_profile pipe_profile_from_va(VAProfile profile)
       return PIPE_VIDEO_PROFILE_MPEG2_SIMPLE;
    case VAProfileMPEG2Main:
       return PIPE_VIDEO_PROFILE_MPEG2_MAIN;
-   case VAProfileMPEG4Simple:
-      return PIPE_VIDEO_PROFILE_MPEG4_SIMPLE;
-   case VAProfileMPEG4AdvancedSimple:
-      return PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE;
    case VAProfileVC1Simple:
       return PIPE_VIDEO_PROFILE_VC1_SIMPLE;
    case VAProfileVC1Main:
@@ -224,10 +219,6 @@ static VAProfile va_profile_from_pipe(enum pipe_video_profile profile)
       return VAProfileMPEG2Simple;
    case PIPE_VIDEO_PROFILE_MPEG2_MAIN:
       return VAProfileMPEG2Main;
-   case PIPE_VIDEO_PROFILE_MPEG4_SIMPLE:
-      return VAProfileMPEG4Simple;
-   case PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE:
-      return VAProfileMPEG4AdvancedSimple;
    case PIPE_VIDEO_PROFILE_VC1_SIMPLE:
       return VAProfileVC1Simple;
    case PIPE_VIDEO_PROFILE_VC1_MAIN:

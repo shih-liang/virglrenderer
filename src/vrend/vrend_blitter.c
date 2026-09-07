@@ -464,7 +464,7 @@ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
 
    vrend_blit_ctx.blit_programs = _mesa_hash_table_u64_create(NULL);
 
-   blit_ctx->use_gles = epoxy_is_desktop_gl() == 0;
+   blit_ctx->use_gles = vrend_is_desktop_gl() == 0;
    ctx_params.shared = true;
    ctx_params.compat_ctx = false;
    for (uint32_t i = 0; i < ARRAY_SIZE(gl_versions); i++) {
@@ -919,4 +919,3 @@ void vrend_blitter_fini(void)
    vrend_clicbs->destroy_gl_context(vrend_blit_ctx.gl_context);
    memset(&vrend_blit_ctx, 0, sizeof(vrend_blit_ctx));
 }
-

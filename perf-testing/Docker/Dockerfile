@@ -41,7 +41,6 @@ RUN apt-get update && \
                                                libcap-dev \
                                                libdbus-1-dev \
                                                libegl1-mesa-dev \
-                                               libepoxy-dev \
                                                libfdt-dev \
                                                libgl1-mesa-dev \
                                                libgles2-mesa-dev \
@@ -103,7 +102,7 @@ WORKDIR /scratch
 # Suppress warnings about detached HEAD, which will happen a lot and is meaningless in this context.
 RUN git config --global advice.detachedHead false
 
-# New libepoxy and libdrm-dev requires newer meson than is in Debian stretch.
+# New libdrm-dev requires newer meson than is in Debian stretch.
 ARG MESON_COMMIT=master
 RUN git clone https://github.com/mesonbuild/meson /meson \
     && cd /meson \

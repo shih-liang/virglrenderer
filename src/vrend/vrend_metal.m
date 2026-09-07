@@ -44,6 +44,12 @@ static bool virgl_format_to_metal_format(uint32_t format, MTLPixelFormat *metal_
    return false;
 }
 
+bool virgl_metal_format_supported(uint32_t format)
+{
+   MTLPixelFormat metal_format;
+   return virgl_format_to_metal_format(format, &metal_format);
+}
+
 static MTLTextureUsage virgl_bind_to_metal_usage_flags(uint32_t flags)
 {
    MTLTextureUsage ret = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
@@ -103,11 +109,12 @@ bool virgl_metal_create_texture(MTLDevice_id device,
                                 MTLTexture_id *tex)
 {
    id<MTLDevice> mtl_device = (id<MTLDevice>)device;
+   *tex = nil;
    MTLTextureDescriptor *descriptor = new_descriptor(desc);
    if (descriptor) {
       *tex = [mtl_device newTextureWithDescriptor:descriptor];
       [descriptor release];
-      return true;
+      return *tex != nil;
    }
 
    return false;

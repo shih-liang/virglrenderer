@@ -27,8 +27,11 @@
 #include "config.h"
 #endif
 
-#include <epoxy/glx.h>
+#define GLX_GLXEXT_PROTOTYPES 1
+#include <GL/glx.h>
+#include <GL/glxext.h>
 #include "virglrenderer.h"
+#include "vrend_gl.h"
 #include "vrend_winsys_glx.h"
 
 struct virgl_glx {
@@ -110,7 +113,7 @@ uint32_t virgl_glx_query_video_memory(struct virgl_glx *d)
 {
    uint32_t video_memory = 0;
    if (d) {
-      if (epoxy_has_glx_extension(d->display, DefaultScreen(d->display), "GLX_MESA_query_renderer")) {
+      if (vrend_has_extension(glXQueryExtensionsString(d->display, DefaultScreen(d->display)), "GLX_MESA_query_renderer")) {
          glXQueryCurrentRendererIntegerMESA(GLX_RENDERER_VIDEO_MEMORY_MESA, &video_memory);
       }
    }

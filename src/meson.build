@@ -32,6 +32,7 @@ virgl_sources = [
 ]
 
 vrend_sources = [
+   'vrend/vrend_gl.c',
    'vrend/iov.c',
    'vrend/vrend_blitter.c',
    'vrend/vrend_debug.c',
@@ -150,14 +151,17 @@ server_sources = [
 
 video_sources = ['vrend/vrend_video.c']
 if with_host_darwin
-  video_sources += ['vrend/virgl_video_videotoolbox.c']
+  video_sources += ['vrend/virgl_video_videotoolbox.c',
+                    'virgl_video_metal.m',
+                    'vrend/virgl_video_hevc.c', 'vrend/virgl_video_av1.c']
 else
   video_sources += ['vrend/virgl_video.c']
 endif
 
 virgl_depends = [
    gallium_dep,
-   epoxy_dep,
+   gl_dep,
+   egl_dep,
    libdrm_dep,
    thread_dep,
    m_dep,

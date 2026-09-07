@@ -25,7 +25,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include <epoxy/gl.h>
+#include "vrend/vrend_gl.h"
 #include <fcntl.h>
 
 #include "util/u_memory.h"
@@ -1789,8 +1789,12 @@ static int vrend_decode_create_video_codec(struct vrend_context *ctx,
    if (length >= VIRGL_CREATE_VIDEO_CODEC_MAX_REF)
       max_ref = get_buf_entry(buf, VIRGL_CREATE_VIDEO_CODEC_MAX_REF);
 
-   return vrend_video_create_codec(vctx, handle, profile, entrypoint,
-                            chroma_fmt, level, width, height, max_ref, 0) ? EINVAL : 0;
+   int result = vrend_video_create_codec(vctx, handle, profile, entrypoint,
+                            chroma_fmt, level, width, height, max_ref, 0);
+   if (result)
+      virgl_error("video codec rejected: profile=%u entrypoint=%u chroma=%u level=%u size=%ux%u\n",
+                  profile, entrypoint, chroma_fmt, level, width, height);
+   return result ? EINVAL : 0;
 }
 
 static int vrend_decode_destroy_video_codec(struct vrend_context *ctx,

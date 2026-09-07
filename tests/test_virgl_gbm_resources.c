@@ -39,7 +39,7 @@
 #include "virgl_protocol.h"
 #include "testvirgl_encode.h"
 #include "virgl_hw.h"
-#include <epoxy/egl.h>
+#include "vrend/vrend_gl.h"
 
 static void
 common_ctx_init(struct virgl_context *ctx)

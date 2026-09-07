@@ -24,14 +24,14 @@
 
 /*
  * macOS implementation of the virgl video interface. VideoToolbox consumes
- * and produces IOSurface-backed CVPixelBuffers; vrend_video.c bridges their
- * short-lived CPU plane mappings to the guest's existing video resources.
+ * and produces IOSurface-backed CVPixelBuffers. A native Metal transfer
+ * copies their planes to/from the guest's fixed shared video resources.
  *
  * Capabilities are the intersection of the Gallium video protocol and the
  * hardware codecs reported by VideoToolbox.  Never advertise a VideoToolbox
  * codec merely because CoreMedia defines its fourcc. Gallium's stateless
- * descriptors cannot reconstruct every stateful bitstream header (notably
- * HEVC reference-picture sets); unsupported configurations fail explicitly.
+ * descriptors are converted to equivalent stateful headers where the decode
+ * state is complete; unsupported configurations fail explicitly.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -50,6 +50,7 @@
 #include "virgl_hw.h"
 #include "virgl_video.h"
 #include "virgl_video_hw.h"
+#include "virgl_video_bitstream.h"
 #include "virgl_util.h"
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
@@ -61,6 +62,18 @@
 #define DRM_FORMAT_R16  FOURCC('R', '1', '6', ' ')
 #define DRM_FORMAT_GR32 FOURCC('G', 'R', '3', '2')
 #define MAX_CODED_BYTES (128u * 1024u * 1024u)
+
+struct decode_completion {
+   uint32_t width, height;
+   virgl_video_decode_done callback;
+   void *data;
+};
+
+static void decode_complete(struct decode_completion *frame, void *pixels)
+{
+   frame->callback(frame->data, pixels);
+   free(frame);
+}
 
 struct byte_buffer {
    uint8_t *data;
@@ -100,6 +113,7 @@ struct virgl_video_codec {
    struct byte_buffer frame_data;
    union virgl_picture_desc frame_desc;
    bool parameter_sets_in_band;
+   struct virgl_av1_rewrite_state av1_state;
 
    VTDecompressionSessionRef decoder;
    CMVideoFormatDescriptionRef decode_format;
@@ -346,6 +360,9 @@ static bool synthesize_h264_parameter_sets(
        sps->bit_depth_chroma_minus8 ||
        (sps->seq_scaling_matrix_present_flag && !scaling) ||
        pps->num_slice_groups_minus1 ||
+       picture->num_ref_frames > 16 ||
+       picture->num_ref_idx_l0_active_minus1 > 31 ||
+       picture->num_ref_idx_l1_active_minus1 > 31 ||
        !sps->frame_mbs_only_flag)
       return false;
 
@@ -357,7 +374,8 @@ static bool synthesize_h264_parameter_sets(
            codec->profile == PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE
               ? 0xc0 : 0,
            8);
-   bw_bits(&writer, sps->level_idc ? sps->level_idc : 40, 8);
+   bw_bits(&writer, sps->level_idc ? sps->level_idc :
+            codec->level && codec->level <= UINT8_MAX ? codec->level : 40, 8);
    bw_ue(&writer, 0); /* seq_parameter_set_id */
    if (profile >= 100) {
       bw_ue(&writer, sps->chroma_format_idc ? sps->chroma_format_idc : 1);
@@ -378,7 +396,10 @@ static bool synthesize_h264_parameter_sets(
       for (unsigned i = 0; i < sps->num_ref_frames_in_pic_order_cnt_cycle; i++)
          bw_se(&writer, sps->offset_for_ref_frame[i]);
    }
-   bw_ue(&writer, sps->max_num_ref_frames);
+   /* VA supplies the resolved values on the picture, not these SPS/PPS
+    * fields. Mesa leaves max_num_ref_frames and default_active_minus1 zero.
+    * Emitting those zeros misparses P/B slice headers and loses references. */
+   bw_ue(&writer, picture->num_ref_frames);
    bw_bit(&writer, 0); /* gaps_in_frame_num_value_allowed_flag */
 
    width_mbs = (codec->width + 15) / 16;
@@ -417,8 +438,8 @@ static bool synthesize_h264_parameter_sets(
    bw_bit(&writer, pps->entropy_coding_mode_flag);
    bw_bit(&writer, pps->bottom_field_pic_order_in_frame_present_flag);
    bw_ue(&writer, 0); /* num_slice_groups_minus1 */
-   bw_ue(&writer, pps->num_ref_idx_l0_default_active_minus1);
-   bw_ue(&writer, pps->num_ref_idx_l1_default_active_minus1);
+   bw_ue(&writer, picture->num_ref_idx_l0_active_minus1);
+   bw_ue(&writer, picture->num_ref_idx_l1_active_minus1);
    bw_bit(&writer, pps->weighted_pred_flag);
    bw_bits(&writer, pps->weighted_bipred_idc, 2);
    bw_se(&writer, pps->pic_init_qp_minus26);
@@ -545,6 +566,38 @@ static void write_hevc_profile_tier_level(struct bit_writer *writer,
    bw_bits(writer, 0, 32);
    bw_bits(writer, 0, 8);
    bw_bits(writer, level_idc, 8);
+   /* Permit all seven temporal sublayers. The descriptor does not carry the
+    * original maximum, and VCL temporal IDs must not be flattened: doing so
+    * changes POC derivation for reordered pictures. No sublayer overrides. */
+   bw_bits(writer, 0, 16);
+}
+
+static void write_hevc_scaling_lists(struct bit_writer *writer,
+                                      const struct virgl_h265_sps *sps)
+{
+   /* Gallium's resolved matrices are already in diagonal scan order. */
+   for (unsigned size = 0; size < 4; size++) {
+      unsigned matrices = size == 3 ? 2 : 6;
+      for (unsigned matrix = 0; matrix < matrices; matrix++) {
+         const uint8_t *values = size == 0 ? sps->ScalingList4x4[matrix] :
+            size == 1 ? sps->ScalingList8x8[matrix] :
+            size == 2 ? sps->ScalingList16x16[matrix] : sps->ScalingList32x32[matrix];
+         unsigned previous = 8;
+         bw_bit(writer, 1); /* scaling_list_pred_mode_flag: explicit values */
+         if (size >= 2) {
+            previous = size == 2 ? sps->ScalingListDCCoeff16x16[matrix] :
+                                  sps->ScalingListDCCoeff32x32[matrix];
+            if (!previous) { writer->failed = true; return; }
+            bw_se(writer, (int)previous - 8);
+         }
+         for (unsigned i = 0; i < (size ? 64u : 16u); i++) {
+            if (!values[i]) { writer->failed = true; return; }
+            int delta = (values[i] - previous + 128) & 255;
+            bw_se(writer, delta - 128);
+            previous = values[i];
+         }
+      }
+   }
 }
 
 static bool append_hevc_rbsp(struct byte_buffer *output, uint8_t nal_type,
@@ -583,8 +636,7 @@ static bool synthesize_hevc_parameter_sets(
    uint32_t poc_bits = sps->log2_max_pic_order_cnt_lsb_minus4 + 4;
 
    if (!profile_idc || pps_id > 63 || sps->chroma_format_idc != 1 ||
-       sps->separate_colour_plane_flag || sps->scaling_list_enabled_flag ||
-       sps->num_short_term_ref_pic_sets || sps->num_long_term_ref_pics_sps ||
+       sps->separate_colour_plane_flag || sps->sps_max_dec_pic_buffering_minus1 > 15 ||
        !width || !height || width > 16384 || height > 16384 ||
        width < codec->width || height < codec->height ||
        sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8 ||
@@ -596,7 +648,8 @@ static bool synthesize_hevc_parameter_sets(
        (crop_right & 1) || (crop_bottom & 1) ||
        picture->NumPocStCurrBefore > ARRAY_SIZE(picture->RefPicSetStCurrBefore) ||
        picture->NumPocStCurrAfter > ARRAY_SIZE(picture->RefPicSetStCurrAfter) ||
-       sps->num_long_term_ref_pics_sps > ARRAY_SIZE(picture->RefPicSetLtCurr))
+       picture->NumPocLtCurr > ARRAY_SIZE(picture->RefPicSetLtCurr) ||
+       sps->num_short_term_ref_pic_sets > 64 || sps->num_long_term_ref_pics_sps > 32)
       return false;
 
    memset(&writer, 0, sizeof(writer));
@@ -606,13 +659,13 @@ static bool synthesize_hevc_parameter_sets(
    bw_bit(&writer, 1);      /* vps_base_layer_internal_flag */
    bw_bit(&writer, 1);      /* vps_base_layer_available_flag */
    bw_bits(&writer, 0, 6);  /* vps_max_layers_minus1 */
-   bw_bits(&writer, 0, 3);  /* vps_max_sub_layers_minus1 */
+   bw_bits(&writer, 6, 3);  /* vps_max_sub_layers_minus1 */
    bw_bit(&writer, 1);      /* vps_temporal_id_nesting_flag */
    bw_bits(&writer, 0xffff, 16);
    write_hevc_profile_tier_level(&writer, profile_idc, level_idc);
    bw_bit(&writer, 0); /* vps_sub_layer_ordering_info_present_flag */
-   bw_ue(&writer, MIN2(MAX2(codec->max_references, 1), 15) - 1);
-   bw_ue(&writer, 0); /* vps_max_num_reorder_pics */
+   bw_ue(&writer, sps->sps_max_dec_pic_buffering_minus1);
+   bw_ue(&writer, sps->sps_max_dec_pic_buffering_minus1);
    bw_ue(&writer, 0); /* vps_max_latency_increase_plus1 */
    bw_bits(&writer, 0, 6); /* vps_max_layer_id */
    bw_ue(&writer, 0);      /* vps_num_layer_sets_minus1 */
@@ -625,7 +678,7 @@ static bool synthesize_hevc_parameter_sets(
    writer.data = rbsp;
    writer.capacity = sizeof(rbsp);
    bw_bits(&writer, 0, 4); /* sps_video_parameter_set_id */
-   bw_bits(&writer, 0, 3); /* sps_max_sub_layers_minus1 */
+   bw_bits(&writer, 6, 3); /* sps_max_sub_layers_minus1 */
    bw_bit(&writer, 1);     /* sps_temporal_id_nesting_flag */
    write_hevc_profile_tier_level(&writer, profile_idc, level_idc);
    bw_ue(&writer, 0); /* sps_seq_parameter_set_id */
@@ -643,9 +696,8 @@ static bool synthesize_hevc_parameter_sets(
    bw_ue(&writer, sps->bit_depth_chroma_minus8);
    bw_ue(&writer, sps->log2_max_pic_order_cnt_lsb_minus4);
    bw_bit(&writer, 0); /* sps_sub_layer_ordering_info_present_flag */
-   bw_ue(&writer, MIN2(MAX2(sps->sps_max_dec_pic_buffering_minus1 + 1,
-                            codec->max_references), 16) - 1);
-   bw_ue(&writer, 0); /* sps_max_num_reorder_pics */
+   bw_ue(&writer, sps->sps_max_dec_pic_buffering_minus1);
+   bw_ue(&writer, sps->sps_max_dec_pic_buffering_minus1);
    bw_ue(&writer, 0); /* sps_max_latency_increase_plus1 */
    bw_ue(&writer, sps->log2_min_luma_coding_block_size_minus3);
    bw_ue(&writer, sps->log2_diff_max_min_luma_coding_block_size);
@@ -653,7 +705,11 @@ static bool synthesize_hevc_parameter_sets(
    bw_ue(&writer, sps->log2_diff_max_min_transform_block_size);
    bw_ue(&writer, sps->max_transform_hierarchy_depth_inter);
    bw_ue(&writer, sps->max_transform_hierarchy_depth_intra);
-   bw_bit(&writer, 0); /* scaling_list_enabled_flag */
+   bw_bit(&writer, sps->scaling_list_enabled_flag);
+   if (sps->scaling_list_enabled_flag) {
+      bw_bit(&writer, 1); /* sps_scaling_list_data_present_flag */
+      write_hevc_scaling_lists(&writer, sps);
+   }
    bw_bit(&writer, sps->amp_enabled_flag);
    bw_bit(&writer, sps->sample_adaptive_offset_enabled_flag);
    bw_bit(&writer, sps->pcm_enabled_flag);
@@ -664,12 +720,10 @@ static bool synthesize_hevc_parameter_sets(
       bw_ue(&writer, sps->log2_diff_max_min_pcm_luma_coding_block_size);
       bw_bit(&writer, sps->pcm_loop_filter_disabled_flag);
    }
-   /* The protocol supplies counts, not SPS RPS entries. Only the empty
-    * sets can be reconstructed; nonempty sets require original VPS/SPS/PPS. */
+   /* Resolved RPS values are serialized in each rewritten slice. */
    bw_ue(&writer, 0); /* num_short_term_ref_pic_sets */
-   bw_bit(&writer, sps->long_term_ref_pics_present_flag);
-   if (sps->long_term_ref_pics_present_flag)
-      bw_ue(&writer, 0); /* num_long_term_ref_pics_sps */
+   bw_bit(&writer, 1); /* long_term_ref_pics_present_flag */
+   bw_ue(&writer, 0); /* num_long_term_ref_pics_sps */
    bw_bit(&writer, sps->sps_temporal_mvp_enabled_flag);
    bw_bit(&writer, sps->strong_intra_smoothing_enabled_flag);
    bw_bit(&writer, 0); /* vui_parameters_present_flag */
@@ -729,7 +783,7 @@ static bool synthesize_hevc_parameter_sets(
       }
    }
    bw_bit(&writer, 0); /* pps_scaling_list_data_present_flag */
-   bw_bit(&writer, pps->lists_modification_present_flag);
+   bw_bit(&writer, 1); /* slices preserve the effective reference list order */
    bw_ue(&writer, pps->log2_parallel_merge_level_minus2);
    bw_bit(&writer, pps->slice_segment_header_extension_present_flag);
    bw_bit(&writer, 0); /* pps_extension_present_flag */
@@ -1158,27 +1212,31 @@ static void decoder_output(void *decompression_refcon,
                            CMTime presentation_time,
                            CMTime presentation_duration)
 {
-   struct virgl_video_buffer *target = source_frame_refcon;
+   struct decode_completion *frame = source_frame_refcon;
    (void)decompression_refcon;
    (void)info_flags;
    (void)presentation_time;
    (void)presentation_duration;
-   target->status = status != noErr ? status : kVTVideoDecoderBadDataErr;
    if (status != noErr || !image_buffer ||
        (info_flags & kVTDecodeInfo_FrameDropped) ||
-       CVPixelBufferGetWidth(image_buffer) < target->width ||
-       CVPixelBufferGetHeight(image_buffer) < target->height)
+       CVPixelBufferGetWidth(image_buffer) < frame->width ||
+       CVPixelBufferGetHeight(image_buffer) < frame->height) {
+      virgl_error("VideoToolbox output rejected: status=%d flags=%u image=%zux%zu target=%ux%u\n",
+         (int)status, (unsigned)info_flags,
+         image_buffer ? CVPixelBufferGetWidth(image_buffer) : 0,
+         image_buffer ? CVPixelBufferGetHeight(image_buffer) : 0,
+         frame->width, frame->height);
+      decode_complete(frame, NULL);
       return;
-   target->status = noErr;
-   CVPixelBufferRetain(image_buffer);
-   if (target->pixel_buffer)
-      CVPixelBufferRelease(target->pixel_buffer);
-   target->pixel_buffer = image_buffer;
+   }
+   decode_complete(frame, image_buffer);
 }
 
 static OSType cv_pixel_format(enum pipe_format format)
 {
    switch (format) {
+   case PIPE_FORMAT_IYUV:
+   case PIPE_FORMAT_YV12:
    case PIPE_FORMAT_NV12:
       return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
    case PIPE_FORMAT_P010:
@@ -1226,6 +1284,9 @@ static CFDictionaryRef create_pixel_buffer_attributes(enum pipe_format format)
 static void destroy_decoder(struct virgl_video_codec *codec)
 {
    if (codec->decoder) {
+      /* Drain only when destroying/replacing a session, never after each
+       * picture. Submitted callbacks own their targets independently. */
+      VTDecompressionSessionWaitForAsynchronousFrames(codec->decoder);
       VTDecompressionSessionInvalidate(codec->decoder);
       CFRelease(codec->decoder);
       codec->decoder = NULL;
@@ -1280,7 +1341,7 @@ static bool create_decoder_session(struct virgl_video_codec *codec,
    OSStatus status;
 
    callback.decompressionOutputCallback = decoder_output;
-   callback.decompressionOutputRefCon = codec;
+   callback.decompressionOutputRefCon = NULL;
    specification = CFDictionaryCreateMutable(
       kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
       &kCFTypeDictionaryValueCallBacks);
@@ -1700,15 +1761,13 @@ static bool call_with_planes(struct virgl_video_codec *codec,
                                               const struct virgl_video_dma_buf *))
 {
    struct virgl_video_dma_buf mapped;
-   CVPixelBufferLockFlags lock_flags =
-      flags == VIRGL_VIDEO_DMABUF_READ_ONLY ? kCVPixelBufferLock_ReadOnly : 0;
    size_t planes;
 
-   if (!buffer->pixel_buffer || !callback ||
-       CVPixelBufferLockBaseAddress(buffer->pixel_buffer, lock_flags) != kCVReturnSuccess)
+   if (!buffer->pixel_buffer || !callback)
       return false;
    memset(&mapped, 0, sizeof(mapped));
    mapped.buf = buffer;
+   mapped.native_frame = buffer->pixel_buffer;
    mapped.drm_format = buffer->format == PIPE_FORMAT_P010
       ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
    mapped.width = buffer->width;
@@ -1717,7 +1776,6 @@ static bool call_with_planes(struct virgl_video_codec *codec,
    planes = CVPixelBufferGetPlaneCount(buffer->pixel_buffer);
    if (planes != 2 || CVPixelBufferGetPixelFormatType(buffer->pixel_buffer) !=
                        cv_pixel_format(buffer->format)) {
-      CVPixelBufferUnlockBaseAddress(buffer->pixel_buffer, lock_flags);
       return false;
    }
    mapped.num_planes = planes;
@@ -1727,7 +1785,6 @@ static bool call_with_planes(struct virgl_video_codec *codec,
       size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(buffer->pixel_buffer, i);
       if (!width || !height || width > UINT32_MAX || height > UINT32_MAX ||
           pitch > UINT32_MAX / height) {
-         CVPixelBufferUnlockBaseAddress(buffer->pixel_buffer, lock_flags);
          return false;
       }
       mapped.planes[i].fd = -1;
@@ -1735,16 +1792,12 @@ static bool call_with_planes(struct virgl_video_codec *codec,
          mapped.planes[i].drm_format = i ? DRM_FORMAT_GR32 : DRM_FORMAT_R16;
       else
          mapped.planes[i].drm_format = i ? DRM_FORMAT_GR88 : DRM_FORMAT_R8;
-      mapped.planes[i].data = CVPixelBufferGetBaseAddressOfPlane(
-         buffer->pixel_buffer, i);
       mapped.planes[i].width = width;
       mapped.planes[i].height = height;
       mapped.planes[i].pitch = pitch;
       mapped.planes[i].size = pitch * height;
    }
-   int result = callback(codec, &mapped);
-   CVPixelBufferUnlockBaseAddress(buffer->pixel_buffer, lock_flags);
-   return result == 0;
+   return callback(codec, &mapped) == 0;
 }
 
 int virgl_video_init(int drm_fd, struct virgl_video_callbacks *callbacks,
@@ -1814,9 +1867,9 @@ int virgl_video_fill_caps(union virgl_caps *caps)
    }
    for (unsigned i = 0; i < ARRAY_SIZE(hevc_profiles); i++) {
       enum pipe_format format = surface_format_for_profile(hevc_profiles[i]);
-      /* The wire SPS has RPS counts, not the RPS entries. The direct backend
-       * accepts original VPS/SPS/PPS, but cannot advertise general stateless
-       * HEVC decode to guest Mesa until the protocol carries those headers. */
+      if (VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC))
+         add_cap(caps, hevc_profiles[i], PIPE_VIDEO_ENTRYPOINT_BITSTREAM,
+                 format, 62, 8192);
       if (hardware_encoder_supported(hevc_profiles[i]))
          add_cap(caps, hevc_profiles[i], PIPE_VIDEO_ENTRYPOINT_ENCODE,
                  format, 62, 8192);
@@ -1830,9 +1883,9 @@ int virgl_video_fill_caps(union virgl_caps *caps)
       add_cap(caps, PIPE_VIDEO_PROFILE_VP9_PROFILE2,
               PIPE_VIDEO_ENTRYPOINT_BITSTREAM, PIPE_FORMAT_P010, 62, 8192);
    }
-   /* AV1's stateless picture/tiles do not guarantee a sequence-header OBU.
-    * Retain the original-bitstream implementation without over-advertising
-    * it to an unmodified guest VA-API frontend. */
+   /* AV1 descriptor-to-OBU reconstruction is available, but general guest
+    * support also needs VT hidden-frame output and distinct film-grain target
+    * delivery. Do not advertise those unverified lifecycle semantics. */
    return 0;
 }
 
@@ -1903,8 +1956,8 @@ struct virgl_video_buffer *virgl_video_create_buffer(
       const struct virgl_video_create_buffer_args *args)
 {
    struct virgl_video_buffer *buffer;
-   if (!args || (args->format != PIPE_FORMAT_NV12 &&
-                 args->format != PIPE_FORMAT_P010) || !args->width ||
+   if (!args || (args->format != PIPE_FORMAT_NV12 && args->format != PIPE_FORMAT_IYUV &&
+                 args->format != PIPE_FORMAT_YV12 && args->format != PIPE_FORMAT_P010) || !args->width ||
        !args->height || args->width > 16384 || args->height > 16384 ||
        args->interlaced || !next_buffer_id)
       return NULL;
@@ -1948,7 +2001,7 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
    codec->frame_failed = false;
    target->status = kVTVideoDecoderBadDataErr;
    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE) {
-      if (target->format != surface_format_for_profile(codec->profile) ||
+      if (cv_pixel_format(target->format) != cv_pixel_format(surface_format_for_profile(codec->profile)) ||
           (!target->pixel_buffer && !make_pixel_buffer(
               target->format, target->width, target->height, &target->pixel_buffer)) ||
           !video_callbacks || !call_with_planes(
@@ -1962,13 +2015,13 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
 
 static int submit_decode_sample(struct virgl_video_codec *codec,
                                 struct virgl_video_buffer *target,
-                                struct byte_buffer *sample)
+                                struct byte_buffer *sample,
+                                virgl_video_decode_done completion, void *data)
 {
    CMBlockBufferRef block = NULL;
    CMSampleBufferRef sample_buffer = NULL;
    size_t sample_size;
    OSStatus status = -1;
-   VTDecodeInfoFlags info_flags = 0;
 
    if (!codec->decoder || !codec->decode_format || !sample->size)
       return -1;
@@ -1987,23 +2040,37 @@ static int submit_decode_sample(struct virgl_video_codec *codec,
       &sample_size, &sample_buffer);
    if (status != noErr)
       goto out;
-   target->status = -1;
+   struct decode_completion *frame = calloc(1, sizeof(*frame));
+   if (!frame) { status = -1; goto out; }
+   frame->width = target->width; frame->height = target->height;
+   frame->callback = completion; frame->data = data;
    status = VTDecompressionSessionDecodeFrame(
-      codec->decoder, sample_buffer, 0, target, &info_flags);
-   /* With both async/temporal flags clear, Apple's API guarantees that the
-    * callback completes before returning. No async queue followed by a drain. */
-   if (status == noErr)
-      status = target->status;
+      codec->decoder, sample_buffer, kVTDecodeFrame_EnableAsynchronousDecompression,
+      frame, NULL);
+   if (status != noErr)
+      virgl_error("VideoToolbox asynchronous decode rejected: status=%d profile=%u\n",
+                  (int)status, codec->profile);
+   /* Apple's contract: an error means no callback; success guarantees one
+    * (possibly inline). Each sample here contains exactly one picture. Only
+    * that callback, or synchronous rejection, owns and frees frameRefcon. */
+   if (status != noErr)
+      decode_complete(frame, NULL);
+   /* Once VT was called, completion owns the outcome (including rejection). */
+   status = noErr;
 
 out:
    if (sample_buffer) CFRelease(sample_buffer);
    if (block) CFRelease(block);
+   if (status != noErr)
+      virgl_error("VideoToolbox decode failed: status=%d profile=%u size=%ux%u\n",
+                  (int)status, codec->profile, codec->width, codec->height);
    return status == noErr ? 0 : -1;
 }
 
 /* Decode once per begin/end frame, not once per slice-data command. */
 static int decode_frame(struct virgl_video_codec *codec,
-                         struct virgl_video_buffer *target)
+                         struct virgl_video_buffer *target,
+                         virgl_video_decode_done completion, void *data)
 {
    const union virgl_picture_desc *desc = &codec->frame_desc;
    unsigned num_buffers = 1;
@@ -2017,11 +2084,13 @@ static int decode_frame(struct virgl_video_codec *codec,
    enum pipe_format surface_format;
    uint32_t pps_id;
    int result = -1;
+   struct virgl_av1_rewrite_state next_av1;
+   bool rewritten_av1 = false;
 
    surface_format = surface_format_for_profile(codec->profile);
    if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN)
-      surface_format = target->format;
-   if (target->format != surface_format)
+      surface_format = target->format == PIPE_FORMAT_P010 ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
+   if (cv_pixel_format(target->format) != cv_pixel_format(surface_format))
       goto out;
 
    if (h264_profile_supported(codec->profile)) {
@@ -2067,6 +2136,25 @@ static int decode_frame(struct virgl_video_codec *codec,
             virgl_error("VideoToolbox HEVC stream has no usable VPS/SPS/PPS\n");
             goto out;
          }
+         struct byte_buffer normalized = {0};
+         size_t pos = 0;
+         bool complete = true;
+         while (pos + 4 <= sample.size) {
+            unsigned n = read_u32be(sample.data + pos);
+            pos += 4;
+            if (n < 2 || n > sample.size - pos) { complete = false; break; }
+            unsigned type = (sample.data[pos] >> 1) & 63;
+            struct virgl_video_bitstream slice = {0};
+            bool ok = type > 31 || virgl_video_hevc_rewrite(&desc->h265, sample.data + pos, n, &slice);
+            if (ok) ok = bb_append_u32be(&normalized, slice.data ? slice.size : n) &&
+               bb_append(&normalized, slice.data ? slice.data : sample.data + pos, slice.data ? slice.size : n);
+            free(slice.data);
+            if (!ok) { complete = false; break; }
+            pos += n;
+         }
+         if (!complete || pos != sample.size) { bb_clear(&normalized); goto out; }
+         bb_clear(&sample);
+         sample = normalized;
       }
       if (!ensure_hevc_decoder(codec, surface_format, &vps, &sps, &pps))
          goto out;
@@ -2087,15 +2175,27 @@ static int decode_frame(struct virgl_video_codec *codec,
    } else if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
       const uint8_t *config_data;
       size_t config_size;
+      if (desc->av1.film_grain_target && desc->av1.film_grain_target != target->id) {
+         virgl_error("VideoToolbox AV1 needs separate reference/display target delivery\n");
+         goto out;
+      }
       if (desc->av1.picture_parameter.profile != 0 ||
           desc->av1.picture_parameter.bit_depth_idx > 1 ||
           desc->av1.picture_parameter.seq_info_fields.mono_chrome ||
-          target->format != (desc->av1.picture_parameter.bit_depth_idx ?
+          cv_pixel_format(target->format) != cv_pixel_format(desc->av1.picture_parameter.bit_depth_idx ?
                               PIPE_FORMAT_P010 : PIPE_FORMAT_NV12))
          goto out;
-      if (!join_bitstream(num_buffers, buffers, sizes, &sample))
+      if (desc->av1.slice_parameter.slice_count) {
+         struct virgl_video_bitstream rewritten = {0}, config = {0};
+         if (!virgl_video_av1_rewrite(&codec->av1_state, &next_av1, &desc->av1,
+              target->id, codec->frame_data.data, codec->frame_data.size,
+              &rewritten, &config)) goto out;
+         sample = (struct byte_buffer){.data = rewritten.data, .size = rewritten.size};
+         configuration = (struct byte_buffer){.data = config.data, .size = config.size};
+         rewritten_av1 = true;
+      } else if (!join_bitstream(num_buffers, buffers, sizes, &sample))
          goto out;
-      if (build_av1_configuration(codec, &desc->av1, sample.data, sample.size,
+      if (rewritten_av1 || build_av1_configuration(codec, &desc->av1, sample.data, sample.size,
                                   &configuration)) {
          config_data = configuration.data;
          config_size = configuration.size;
@@ -2109,10 +2209,10 @@ static int decode_frame(struct virgl_video_codec *codec,
    } else {
       goto out;
    }
-   result = submit_decode_sample(codec, target, &sample);
+   result = submit_decode_sample(codec, target, &sample, completion, data);
+   if (!result && rewritten_av1) codec->av1_state = next_av1;
 
 out:
-   codec->frame_ready = result == 0;
    bb_clear(&sample);
    bb_clear(&configuration);
    bb_clear(&vps);
@@ -2165,7 +2265,7 @@ int virgl_video_encode_bitstream(struct virgl_video_codec *codec,
        codec->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE ||
        desc->base.profile != codec->profile)
       return -1;
-   if (source->format != surface_format_for_profile(codec->profile))
+   if (cv_pixel_format(source->format) != cv_pixel_format(surface_format_for_profile(codec->profile)))
       return -1;
    if (h264_profile_supported(codec->profile)) {
       target_bitrate = desc->h264_enc.rate_ctrl[0].target_bitrate;
@@ -2243,24 +2343,31 @@ out_encode:
    return codec->frame_ready ? 0 : -1;
 }
 
+int virgl_video_end_frame_async(struct virgl_video_codec *codec,
+                               struct virgl_video_buffer *target,
+                               virgl_video_decode_done completion, void *data)
+{
+   if (!codec || !target || !completion || codec->frame_buffer_id != target->id ||
+       codec->entrypoint != PIPE_VIDEO_ENTRYPOINT_BITSTREAM)
+      return -1;
+   int result = !codec->frame_failed && codec->frame_data.size
+      ? decode_frame(codec, target, completion, data) : -1;
+   bb_clear(&codec->frame_data);
+   codec->frame_buffer_id = 0;
+   return result;
+}
+
 int virgl_video_end_frame(struct virgl_video_codec *codec,
                           struct virgl_video_buffer *target)
 {
-   if (!codec || !target || codec->frame_buffer_id != target->id)
+   if (!codec || !target || codec->frame_buffer_id != target->id ||
+       codec->entrypoint != PIPE_VIDEO_ENTRYPOINT_ENCODE)
       return -1;
-   if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM) {
-      if (!codec->frame_failed && codec->frame_data.size)
-         codec->frame_ready = decode_frame(codec, target) == 0;
-      bb_clear(&codec->frame_data);
-   }
    codec->frame_buffer_id = 0;
    bool ready = codec->frame_ready;
    codec->frame_ready = false;
    if (!ready || !video_callbacks)
       return -1;
-   if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM)
-      return call_with_planes(codec, target, VIRGL_VIDEO_DMABUF_READ_ONLY,
-                              video_callbacks->decode_completed) ? 0 : -1;
    unsigned size = codec->coded_size;
    const void *data = codec->coded_data;
    if (codec->coded_size > UINT_MAX || !video_callbacks->encode_completed)

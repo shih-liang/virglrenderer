@@ -25,7 +25,7 @@
 #include "vrend_winsys.h"
 #include "vrend_debug.h"
 
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
 #include "vrend_winsys_glx.h"
 #endif
 
@@ -40,7 +40,7 @@ enum {
 
 static int use_context = CONTEXT_NONE;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
 struct virgl_egl *egl = NULL;
 #endif
 
@@ -48,7 +48,7 @@ struct virgl_egl *egl = NULL;
 struct virgl_gbm *gbm = NULL;
 #endif
 
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
 static struct virgl_glx *glx_info = NULL;
 #endif
 
@@ -82,7 +82,7 @@ int vrend_winsys_init(uint32_t flags, int preferred_fd)
       return -1;
 #endif
    } else if (flags & VIRGL_RENDERER_USE_GLX) {
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
       glx_info = virgl_glx_init();
       if (!glx_info)
          return -1;
@@ -113,7 +113,7 @@ void vrend_winsys_cleanup(void)
       use_context = CONTEXT_NONE;
    }
 #endif
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
    if (use_context == CONTEXT_GLX) {
       virgl_glx_destroy(glx_info);
       glx_info = NULL;
@@ -124,7 +124,7 @@ void vrend_winsys_cleanup(void)
 
 int vrend_winsys_init_external(void *egl_display)
 {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
       egl = virgl_egl_init_external(egl_display);
       if (!egl)
          return -1;
@@ -141,12 +141,12 @@ int vrend_winsys_init_external(void *egl_display)
 
 virgl_renderer_gl_context vrend_winsys_create_context(UNUSED struct virgl_gl_ctx_param *param)
 {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (use_context == CONTEXT_EGL ||
        use_context == CONTEXT_EGL_EXTERNAL)
       return virgl_egl_create_context(egl, param);
 #endif
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
    if (use_context == CONTEXT_GLX)
       return virgl_glx_create_context(glx_info, param);
 #endif
@@ -155,14 +155,14 @@ virgl_renderer_gl_context vrend_winsys_create_context(UNUSED struct virgl_gl_ctx
 
 void vrend_winsys_destroy_context(UNUSED virgl_renderer_gl_context ctx)
 {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (use_context == CONTEXT_EGL ||
        use_context == CONTEXT_EGL_EXTERNAL) {
       virgl_egl_destroy_context(egl, ctx);
       return;
    }
 #endif
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
    if (use_context == CONTEXT_GLX) {
       virgl_glx_destroy_context(glx_info, ctx);
       return;
@@ -173,7 +173,7 @@ void vrend_winsys_destroy_context(UNUSED virgl_renderer_gl_context ctx)
 int vrend_winsys_make_context_current(UNUSED virgl_renderer_gl_context ctx)
 {
    int ret = -1;
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (use_context == CONTEXT_EGL ||
        use_context == CONTEXT_EGL_EXTERNAL) {
       ret = virgl_egl_make_context_current(egl, ctx);
@@ -182,7 +182,7 @@ int vrend_winsys_make_context_current(UNUSED virgl_renderer_gl_context ctx)
                       __func__, virgl_egl_error_string(eglGetError()));
    }
 #endif
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
    if (use_context == CONTEXT_GLX) {
       ret = virgl_glx_make_context_current(glx_info, ctx);
       if (ret)
@@ -196,7 +196,7 @@ int vrend_winsys_make_context_current(UNUSED virgl_renderer_gl_context ctx)
 int vrend_winsys_has_gl_colorspace(void)
 {
    bool egl_colorspace = false;
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (egl)
       egl_colorspace = virgl_has_egl_khr_gl_colorspace(egl);
 #endif
@@ -259,7 +259,7 @@ int vrend_winsys_get_fd_for_texture2(uint32_t tex_id, int *fd, int *stride, int 
 
 uint32_t vrend_winsys_query_video_memory(void)
 {
-#ifdef HAVE_EPOXY_GLX_H
+#ifdef HAVE_GLX
    return virgl_glx_query_video_memory(glx_info);
 #else
    return 0;
@@ -272,7 +272,7 @@ uint32_t vrend_winsys_query_video_memory(void)
  */
 bool vrend_winsys_different_gpu(void)
 {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (egl)
       return virgl_egl_different_gpu(egl);
 #endif

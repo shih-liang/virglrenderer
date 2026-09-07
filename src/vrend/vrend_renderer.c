@@ -66,8 +66,10 @@
 
 #include "tgsi/tgsi_text.h"
 
-#ifdef HAVE_EPOXY_GLX_H
-#include <epoxy/glx.h>
+#ifdef HAVE_GLX
+#define GLX_GLXEXT_PROTOTYPES 1
+#include <GL/glx.h>
+#include <GL/glxext.h>
 #endif
 
 #ifdef ENABLE_VIDEO
@@ -106,7 +108,7 @@ struct vrend_fence {
 
    union {
       GLsync glsyncobj;
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
       EGLSyncKHR eglsyncobj;
 #endif
    };
@@ -402,7 +404,7 @@ struct global_renderer_state {
    /* async fence callback */
    bool use_async_fence_cb : 1;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    bool use_egl_fence : 1;
 #endif
    bool native_share_texture : 1;
@@ -878,7 +880,9 @@ struct vrend_context {
 };
 
 static int get_glsl_version(void);
+#ifndef ENABLE_ANGLE
 static void vrend_pause_render_condition(struct vrend_context *ctx, bool pause);
+#endif
 static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx);
 static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx);
 static void vrend_destroy_query_object(void *obj_ptr);
@@ -906,7 +910,7 @@ static inline bool vrend_format_can_sample(enum virgl_formats format)
    if (tex_conv_table[format].bindings & VIRGL_BIND_SAMPLER_VIEW)
       return true;
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    uint32_t gbm_format = 0;
    if (virgl_gbm_convert_format(&format, &gbm_format))
       return false;
@@ -943,7 +947,12 @@ static inline bool vrend_format_is_ds(enum virgl_formats format)
 
 static inline bool vrend_format_can_scanout(enum virgl_formats format)
 {
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#ifdef ENABLE_METAL
+   if (vrend_state.native_share_texture)
+      return tex_conv_table[format].internalformat != 0 &&
+             virgl_metal_format_supported(format);
+#endif
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    uint32_t gbm_format = 0;
    if (virgl_gbm_convert_format(&format, &gbm_format))
       return false;
@@ -958,7 +967,7 @@ static inline bool vrend_format_can_scanout(enum virgl_formats format)
 #endif
 }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
 static inline bool vrend_format_can_texture_view(enum virgl_formats format)
 {
    return has_feature(feat_texture_view) &&
@@ -986,8 +995,39 @@ bool vrend_format_is_bgra(enum virgl_formats format) {
            format == VIRGL_FORMAT_B8G8R8A8_SRGB);
 }
 
+static bool vrend_resource_is_metal(const struct vrend_resource *res)
+{
+#ifdef ENABLE_METAL
+   return res->metal_texture != NULL;
+#else
+   (void)res;
+   return false;
+#endif
+}
+
+static bool vrend_resource_is_native_bgra(const struct vrend_resource *res)
+{
+   return vrend_resource_is_metal(res) && vrend_format_is_bgra(res->base.format);
+}
+
+static GLenum vrend_resource_upload_format(const struct vrend_resource *res)
+{
+   if (vrend_state.use_gles && vrend_resource_is_native_bgra(res))
+      return GL_BGRA_EXT;
+   return tex_conv_table[res->base.format].glformat;
+}
+
+static bool vrend_resource_upload_needs_swizzle(const struct vrend_resource *res)
+{
+   return vrend_state.use_gles && vrend_format_is_bgra(res->base.format) &&
+          vrend_resource_upload_format(res) == GL_RGBA;
+}
+
 static GLuint vrend_resource_get_internal_format_override(const struct vrend_resource *res)
 {
+   /* Metal has no 24-bit RGB/BGR storage. X8 resources remain four bytes. */
+   if (vrend_resource_is_metal(res))
+      return GL_NONE;
    /* Some shared resources imported to guest mesa as EGL images occupy 24bpp instead of more common 32bpp.
     *
     * TODO: perhaps this can be generalized to all alpha-less formats?
@@ -1249,7 +1289,7 @@ static void init_features(int gl_ver, int gles_ver)
          for (uint32_t i = 0; i < FEAT_MAX_EXTS; i++) {
             if (!feature_list[id].gl_ext[i])
                break;
-            if (epoxy_has_gl_extension(feature_list[id].gl_ext[i])) {
+            if (vrend_has_gl_extension(feature_list[id].gl_ext[i])) {
                set_feature(id);
                VREND_DEBUG(dbg_features, NULL,
                            "Host feature %s provide by %s\n", feature_list[id].log_name,
@@ -2375,6 +2415,7 @@ int vrend_create_surface(struct vrend_context *ctx,
    surf->gl_id = res->gl_id;
    surf->nr_samples = nr_samples;
 
+#ifndef ENABLE_ANGLE
    if (!has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER) &&
          has_bit(res->storage_bits, VREND_STORAGE_GL_IMMUTABLE) &&
          has_feature(feat_texture_view)) {
@@ -2428,6 +2469,7 @@ int vrend_create_surface(struct vrend_context *ctx,
       }
    }
 
+#endif
    pipe_reference_init(&surf->reference, 1);
 
    vrend_resource_reference(&surf->texture, res);
@@ -2564,7 +2606,12 @@ static GLuint convert_wrap(struct vrend_context *ctx, int wrap)
 {
    switch(wrap){
    case PIPE_TEX_WRAP_REPEAT: return GL_REPEAT;
-   case PIPE_TEX_WRAP_CLAMP: if (vrend_state.use_core_profile == false) return GL_CLAMP; else return GL_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_CLAMP:
+#ifndef ENABLE_ANGLE
+      if (!vrend_state.use_core_profile)
+         return GL_CLAMP;
+#endif
+      return GL_CLAMP_TO_EDGE;
 
    case PIPE_TEX_WRAP_CLAMP_TO_EDGE: return GL_CLAMP_TO_EDGE;
    case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
@@ -2658,7 +2705,7 @@ int vrend_create_sampler_state(struct vrend_context *ctx,
          glSamplerParameterf(state->ids[i], GL_TEXTURE_MAG_FILTER, convert_mag_filter(templ->mag_img_filter));
          glSamplerParameterf(state->ids[i], GL_TEXTURE_MIN_LOD, templ->min_lod);
          glSamplerParameterf(state->ids[i], GL_TEXTURE_MAX_LOD, templ->max_lod);
-         glSamplerParameteri(state->ids[i], GL_TEXTURE_COMPARE_MODE, templ->compare_mode ? GL_COMPARE_R_TO_TEXTURE : GL_NONE);
+         glSamplerParameteri(state->ids[i], GL_TEXTURE_COMPARE_MODE, templ->compare_mode ? GL_COMPARE_REF_TO_TEXTURE : GL_NONE);
          glSamplerParameteri(state->ids[i], GL_TEXTURE_COMPARE_FUNC, GL_NEVER + templ->compare_func);
          if (vrend_state.use_gles) {
             if (templ->lod_bias)
@@ -2813,7 +2860,6 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
    }
 
    if (!has_bit(view->texture->storage_bits, VREND_STORAGE_GL_BUFFER)) {
-      enum virgl_formats format;
       bool needs_view = false;
 
       /*
@@ -2834,18 +2880,19 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
        * aways program the underlying DS format as a
        * view could be required for layers.
        */
-      format = view->format;
-      if (util_format_is_depth_or_stencil(view->texture->base.format))
-         format = view->texture->base.format;
-      else if (view->format != view->texture->base.format)
+      if (!util_format_is_depth_or_stencil(view->texture->base.format) &&
+          view->format != view->texture->base.format)
          needs_view = true;
 
       if (view->u.tex.first_layer > 0 || view->u.tex.first_level > 0)
          needs_view = true;
 
+#ifndef ENABLE_ANGLE
       if (needs_view &&
           has_bit(view->texture->storage_bits, VREND_STORAGE_GL_IMMUTABLE) &&
           has_feature(feat_texture_view)) {
+        enum virgl_formats format = util_format_is_depth_or_stencil(view->texture->base.format) ?
+                                       view->texture->base.format : view->format;
         GLenum internalformat = tex_conv_table[format].internalformat;
         view->levels = (view->u.tex.last_level - view->u.tex.first_level) + 1;
 
@@ -2929,7 +2976,9 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
                             view->srgb_decode);
         }
         glBindTexture(view->target, 0);
-      } else if (needs_view && view->u.buf.first_element < ARRAY_SIZE(res->aux_plane_egl_image) &&
+      } else
+#endif
+      if (needs_view && view->u.buf.first_element < ARRAY_SIZE(res->aux_plane_egl_image) &&
             res->aux_plane_egl_image[view->u.buf.first_element]) {
         void *image = res->aux_plane_egl_image[view->u.buf.first_element];
         glGenTextures(1, &view->gl_id);
@@ -3048,8 +3097,7 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
          glFramebufferTexture3DOES(GL_FRAMEBUFFER, attachment,
                                    res->target, id, level, layer);
       else
-         glFramebufferTexture3D(GL_FRAMEBUFFER, attachment,
-                                res->target, id, level, layer);
+         glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, id, level, layer);
       break;
    case GL_TEXTURE_CUBE_MAP:
       if (layer < 0)
@@ -3060,10 +3108,12 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
                                       GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer,
                                       id, level, samples);
       break;
+#ifndef ENABLE_ANGLE
    case GL_TEXTURE_1D:
       glFramebufferTexture1D(GL_FRAMEBUFFER, attachment,
                              res->target, id, level);
       break;
+#endif
    case GL_TEXTURE_2D:
    default:
       vrend_framebuffer_texture_2d(res, GL_FRAMEBUFFER, attachment,
@@ -3073,10 +3123,12 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
 
    if (attachment == GL_DEPTH_ATTACHMENT) {
       switch (res->target) {
+#ifndef ENABLE_ANGLE
       case GL_TEXTURE_1D:
          glFramebufferTexture1D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
                                 GL_TEXTURE_1D, 0, 0);
          break;
+#endif
       case GL_TEXTURE_2D:
       default:
          glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
@@ -3763,10 +3815,12 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
             glBindTexture(view->target, view->gl_id);
 
             if (util_format_is_depth_or_stencil(view->format)) {
+#ifndef ENABLE_ANGLE
                if (vrend_state.use_core_profile == false) {
                   /* setting depth texture mode is deprecated in core profile */
                   glTexParameteri(view->texture->target, GL_DEPTH_TEXTURE_MODE, GL_RED);
                }
+#endif
                if (has_feature(feat_stencil_texturing)) {
                   const struct util_format_description *desc = util_format_description(view->format);
                   if (!util_format_has_depth(desc)) {
@@ -4026,8 +4080,10 @@ void vrend_memory_barrier(UNUSED struct vrend_context *ctx,
 void vrend_texture_barrier(UNUSED struct vrend_context *ctx,
                            unsigned flags)
 {
+#ifndef ENABLE_ANGLE
    if (has_feature(feat_texture_barrier) && (flags & PIPE_TEXTURE_BARRIER_SAMPLER))
       glTextureBarrier();
+#endif
    if (has_feature(feat_blend_equation_advanced) && (flags & PIPE_TEXTURE_BARRIER_FRAMEBUFFER))
       glBlendBarrierKHR();
 }
@@ -4805,9 +4861,12 @@ static void vrend_clear_prepare(struct vrend_sub_context *sub_ctx,
             report_gles_warn(sub_ctx->parent, GLES_WARN_DEPTH_CLEAR);
          }
          glClearDepthf(depth);
-      } else {
+      }
+#ifndef ENABLE_ANGLE
+      else {
          glClearDepth(depth);
       }
+#endif
    }
 
    if (buffers & PIPE_CLEAR_STENCIL) {
@@ -4939,22 +4998,22 @@ int vrend_clear_texture(struct vrend_context* ctx,
    GLenum format, type;
 
    enum virgl_formats fmt = res->base.format;
-   format = tex_conv_table[fmt].glformat;
+   format = vrend_resource_upload_format(res);
    type = tex_conv_table[fmt].gltype;
 
    if (!has_feature(feat_clear_texture)) {
       return EINVAL;
    }
 
-   /* 32-bit BGRA resources are always reordered to RGBA ordering before
-    * submission to the host driver. Reorder red/blue color bytes in
-    * the clear color to match. */
-   if (vrend_state.use_gles && vrend_format_is_bgra(fmt)) {
+   uint8_t swizzled[4];
+   if (data && vrend_resource_upload_needs_swizzle(res)) {
       assert(util_format_get_blocksizebits(fmt) >= 24);
       VREND_DEBUG(dbg_bgra, ctx, "swizzling clear_texture color for bgra texture\n");
-      uint8_t temp = ((uint8_t*)data)[0];
-      ((uint8_t*)data)[0] = ((uint8_t*)data)[2];
-      ((uint8_t*)data)[2] = temp;
+      memcpy(swizzled, data, sizeof(swizzled));
+      uint8_t temp = swizzled[0];
+      swizzled[0] = swizzled[2];
+      swizzled[2] = temp;
+      data = swizzled;
    }
 
    if (vrend_state.use_gles) {
@@ -4974,7 +5033,7 @@ int vrend_clear_texture(struct vrend_context* ctx,
 void vrend_clear_surface(struct vrend_context *ctx, uint32_t surf_handle,
                          unsigned buffers, const union pipe_color_union *color,
                          unsigned dstx, unsigned dsty, unsigned width,
-                         unsigned height, bool render_condition_enabled) {
+                         unsigned height, UNUSED bool render_condition_enabled) {
    struct vrend_surface *surf;
    GLbitfield bits = 0;
    struct vrend_sub_context *sub_ctx = ctx->sub;
@@ -4994,8 +5053,10 @@ void vrend_clear_surface(struct vrend_context *ctx, uint32_t surf_handle,
       return;
    }
 
+#ifndef ENABLE_ANGLE
    if (render_condition_enabled == false)
       vrend_pause_render_condition(ctx, true);
+#endif
 
    glScissor(dstx, dsty, width, height);
    glEnable(GL_SCISSOR_TEST);
@@ -5036,8 +5097,10 @@ void vrend_clear_surface(struct vrend_context *ctx, uint32_t surf_handle,
                           GL_TEXTURE_2D, 0, 0);
    glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->fb_id);
 
+#ifndef ENABLE_ANGLE
    if (render_condition_enabled == false)
       vrend_pause_render_condition(ctx, false);
+#endif
 }
 
 static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx)
@@ -5056,9 +5119,11 @@ static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx)
       ss = &sub_ctx->ss[idx];
       y = ss->miny;
 
+#ifndef ENABLE_ANGLE
       if (idx > 0 && has_feature(feat_viewport_array))
          glScissorIndexed(idx, ss->minx, y, ss->maxx - ss->minx, ss->maxy - ss->miny);
       else
+#endif
          glScissor(ss->minx, y, ss->maxx - ss->minx, ss->maxy - ss->miny);
    }
    sub_ctx->scissor_state_dirty = 0;
@@ -5076,11 +5141,16 @@ static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx)
          cy = sub_ctx->vps[idx].cur_y - sub_ctx->vps[idx].height;
       else
          cy = sub_ctx->vps[idx].cur_y;
+#ifndef ENABLE_ANGLE
       if (idx > 0 && has_feature(feat_viewport_array))
          glViewportIndexedf(idx, sub_ctx->vps[idx].cur_x, cy, sub_ctx->vps[idx].width, sub_ctx->vps[idx].height);
       else
+#endif
          glViewport(sub_ctx->vps[idx].cur_x, cy, sub_ctx->vps[idx].width, sub_ctx->vps[idx].height);
 
+#ifdef ENABLE_ANGLE
+      glDepthRangef(sub_ctx->vps[idx].near_val, sub_ctx->vps[idx].far_val);
+#else
       if (idx && has_feature(feat_viewport_array))
          if (vrend_state.use_gles) {
             glDepthRangeIndexedfOES(idx, sub_ctx->vps[idx].near_val, sub_ctx->vps[idx].far_val);
@@ -5091,6 +5161,7 @@ static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx)
             glDepthRangefOES(sub_ctx->vps[idx].near_val, sub_ctx->vps[idx].far_val);
          else
             glDepthRange(sub_ctx->vps[idx].near_val, sub_ctx->vps[idx].far_val);
+#endif
    }
 
    sub_ctx->viewport_state_dirty = 0;
@@ -5136,8 +5207,8 @@ static GLenum get_xfb_mode(GLenum mode)
    case GL_TRIANGLE_STRIP:
    case GL_TRIANGLE_FAN:
    case GL_QUADS:
-   case GL_QUAD_STRIP:
-   case GL_POLYGON:
+   case PIPE_PRIM_QUAD_STRIP:
+   case PIPE_PRIM_POLYGON:
       return GL_TRIANGLES;
    case GL_LINES:
    case GL_LINE_LOOP:
@@ -5263,6 +5334,7 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
    if (ctx->sub->vbo_dirty) {
       struct vrend_vertex_buffer *vbo = &ctx->sub->vbo[0];
 
+#ifndef ENABLE_ANGLE
       if (has_feature(feat_bind_vertex_buffers)) {
          GLsizei count = MAX2(ctx->sub->num_vbos, ctx->sub->old_num_vbos);
 
@@ -5290,7 +5362,9 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
          }
 
          glBindVertexBuffers(0, count, buffers, offsets, strides);
-      } else {
+      } else
+#endif
+      {
          for (i = 0; i < ctx->sub->num_vbos; i++) {
             struct vrend_resource *res = (struct vrend_resource *)vbo[i].base.buffer;
             if (res)
@@ -5591,6 +5665,11 @@ static void vrend_draw_bind_images_shader(struct vrend_sub_context *sub_ctx, int
              (iview->u.tex.first_layer != 0 ||
               num_layers != MAX2(iview->texture->base.array_size,  iview->texture->base.depth0))) {
 
+#ifdef ENABLE_ANGLE
+            /* GLES has no texture views. Reject a partial layered binding. */
+            vrend_report_context_error(sub_ctx->parent, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, iview->texture->gl_id);
+            return;
+#else
             if (iview->view_id)
                glDeleteTextures(1, &iview->view_id);
 
@@ -5599,6 +5678,7 @@ static void vrend_draw_bind_images_shader(struct vrend_sub_context *sub_ctx, int
                           tex_conv_table[iview->texture->base.format].internalformat, level, 1,
                           first_layer, num_layers);
             tex_id = iview->view_id;
+#endif
          }
       }
 
@@ -6122,13 +6202,16 @@ int vrend_draw_vbo(struct vrend_context *ctx,
    if (info->primitive_restart) {
       if (vrend_state.use_gles) {
          glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-      } else if (has_feature(feat_gl_prim_restart)) {
+      }
+#ifndef ENABLE_ANGLE
+      else if (has_feature(feat_gl_prim_restart)) {
          glEnable(GL_PRIMITIVE_RESTART);
          glPrimitiveRestartIndex(info->restart_index);
       } else if (has_feature(feat_nv_prim_restart)) {
          glEnableClientState(GL_PRIMITIVE_RESTART_NV);
          glPrimitiveRestartIndexNV(info->restart_index);
       }
+#endif
    }
 
    if (has_feature(feat_indirect_draw)) {
@@ -6170,10 +6253,13 @@ int vrend_draw_vbo(struct vrend_context *ctx,
       int start = cso ? 0 : info->start;
 
       if (indirect_handle) {
+#ifndef ENABLE_ANGLE
          if (indirect_params_res)
             glMultiDrawArraysIndirectCountARB(mode, (GLvoid const *)(uintptr_t)info->indirect.offset,
                                               info->indirect.indirect_draw_count_offset, info->indirect.draw_count, info->indirect.stride);
-         else if (info->indirect.draw_count > 1)
+         else
+#endif
+         if (info->indirect.draw_count > 1)
             glMultiDrawArraysIndirect(mode, (GLvoid const *)(uintptr_t)info->indirect.offset, info->indirect.draw_count, info->indirect.stride);
          else
             glDrawArraysIndirect(mode, (GLvoid const *)(uintptr_t)info->indirect.offset);
@@ -6201,10 +6287,13 @@ int vrend_draw_vbo(struct vrend_context *ctx,
       }
 
       if (indirect_handle) {
+#ifndef ENABLE_ANGLE
          if (indirect_params_res)
             glMultiDrawElementsIndirectCountARB(mode, elsz, (GLvoid const *)(uintptr_t)info->indirect.offset,
                                                 info->indirect.indirect_draw_count_offset, info->indirect.draw_count, info->indirect.stride);
-         else if (info->indirect.draw_count > 1)
+         else
+#endif
+         if (info->indirect.draw_count > 1)
             glMultiDrawElementsIndirect(mode, elsz, (GLvoid const *)(uintptr_t)info->indirect.offset, info->indirect.draw_count, info->indirect.stride);
          else
             glDrawElementsIndirect(mode, elsz, (GLvoid const *)(uintptr_t)info->indirect.offset);
@@ -6241,11 +6330,14 @@ int vrend_draw_vbo(struct vrend_context *ctx,
    if (info->primitive_restart) {
       if (vrend_state.use_gles) {
          glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-      } else if (has_feature(feat_gl_prim_restart)) {
+      }
+#ifndef ENABLE_ANGLE
+      else if (has_feature(feat_gl_prim_restart)) {
          glDisable(GL_PRIMITIVE_RESTART);
       } else if (has_feature(feat_nv_prim_restart)) {
          glDisableClientState(GL_PRIMITIVE_RESTART_NV);
       }
+#endif
    }
 
    if (sub_ctx->current_so && has_feature(feat_transform_feedback2)) {
@@ -6695,8 +6787,10 @@ static void vrend_hw_emit_dsa(struct vrend_sub_context *sub_ctx)
 
    if (state->alpha.enabled) {
       vrend_alpha_test_enable(sub_ctx, true);
+#ifndef ENABLE_ANGLE
       if (!vrend_state.use_core_profile)
          glAlphaFunc(GL_NEVER + state->alpha.func, state->alpha.ref_value);
+#endif
    } else
       vrend_alpha_test_enable(sub_ctx, false);
 
@@ -6803,6 +6897,7 @@ void vrend_update_stencil_state(struct vrend_sub_context *sub_ctx)
    sub_ctx->stencil_state_dirty = false;
 }
 
+#ifndef ENABLE_ANGLE
 static inline GLenum translate_fill(uint32_t mode)
 {
    switch (mode) {
@@ -6816,6 +6911,7 @@ static inline GLenum translate_fill(uint32_t mode)
       return GL_NONE;
    }
 }
+#endif
 
 static void vrend_hw_emit_rs(struct vrend_context *ctx)
 {
@@ -6864,13 +6960,16 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
       if (state->fill_back != PIPE_POLYGON_MODE_FILL) {
          report_gles_warn(ctx, GLES_WARN_POLYGON_MODE);
       }
-   } else if (vrend_state.use_core_profile == false) {
+   }
+#ifndef ENABLE_ANGLE
+   else if (vrend_state.use_core_profile == false) {
       glPolygonMode(GL_FRONT, translate_fill(state->fill_front));
       glPolygonMode(GL_BACK, translate_fill(state->fill_back));
    } else if (state->fill_front == state->fill_back) {
       glPolygonMode(GL_FRONT_AND_BACK, translate_fill(state->fill_front));
    } else
       report_core_warn(ctx, CORE_PROFILE_WARN_POLYGON_MODE);
+#endif
 
    if (state->offset_tri) {
       glEnable(GL_POLYGON_OFFSET_FILL);
@@ -6901,6 +7000,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
 
    if (state->flatshade != ctx->sub->hw_rs_state.flatshade) {
       ctx->sub->hw_rs_state.flatshade = state->flatshade;
+#ifndef ENABLE_ANGLE
       if (vrend_state.use_core_profile == false) {
          if (state->flatshade) {
             glShadeModel(GL_FLAT);
@@ -6908,6 +7008,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
             glShadeModel(GL_SMOOTH);
          }
       }
+#endif
    }
 
    if (state->clip_halfz != ctx->sub->hw_rs_state.clip_halfz) {
@@ -6927,11 +7028,14 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
          if (state->flatshade_first) {
             report_gles_warn(ctx, GLES_WARN_FLATSHADE_FIRST);
          }
-      } else if (state->flatshade_first) {
+      }
+#ifndef ENABLE_ANGLE
+      else if (state->flatshade_first) {
          glProvokingVertexEXT(GL_FIRST_VERTEX_CONVENTION_EXT);
       } else {
          glProvokingVertexEXT(GL_LAST_VERTEX_CONVENTION_EXT);
       }
+#endif
    }
 
    if (!vrend_state.use_gles && has_feature(feat_polygon_offset_clamp))
@@ -6939,6 +7043,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
    else
        glPolygonOffset(state->offset_scale, state->offset_units);
 
+#ifndef ENABLE_ANGLE
    if (!vrend_shader_use_core(ctx)) {
       if (state->poly_stipple_enable)
          glEnable(GL_POLYGON_STIPPLE);
@@ -6961,6 +7066,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
          glDisable(GL_POINT_SPRITE);
       }
    }
+#endif
 
    if (state->cull_face != PIPE_FACE_NONE) {
       switch (state->cull_face) {
@@ -6980,6 +7086,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
    } else
       glDisable(GL_CULL_FACE);
 
+#ifndef ENABLE_ANGLE
    /* two sided lighting handled in shader for core profile */
    if (vrend_state.use_core_profile == false) {
       if (state->light_twoside)
@@ -6987,6 +7094,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
       else
          glDisable(GL_VERTEX_PROGRAM_TWO_SIDE);
    }
+#endif
 
    if (state->clip_plane_enable != ctx->sub->hw_rs_state.clip_plane_enable) {
       ctx->sub->hw_rs_state.clip_plane_enable = state->clip_plane_enable;
@@ -7004,13 +7112,16 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
          ctx->sub->sysvalue_data.clip_plane_enabled = 0.f;
       }
    }
+#ifndef ENABLE_ANGLE
    if (vrend_state.use_core_profile == false) {
       glLineStipple(state->line_stipple_factor, state->line_stipple_pattern);
       if (state->line_stipple_enable)
          glEnable(GL_LINE_STIPPLE);
       else
          glDisable(GL_LINE_STIPPLE);
-   } else if (state->line_stipple_enable) {
+   } else
+#endif
+   if (state->line_stipple_enable) {
       if (vrend_state.use_gles)
          report_core_warn(ctx, GLES_WARN_STIPPLE);
       else
@@ -7038,6 +7149,7 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
       glDisable(GL_POLYGON_SMOOTH);
    }
 
+#ifndef ENABLE_ANGLE
    if (vrend_state.use_core_profile == false) {
       if (state->clamp_vertex_color)
          glClampColor(GL_CLAMP_VERTEX_COLOR_ARB, GL_TRUE);
@@ -7048,7 +7160,9 @@ static void vrend_hw_emit_rs(struct vrend_context *ctx)
          glClampColor(GL_CLAMP_FRAGMENT_COLOR_ARB, GL_TRUE);
       else
          glClampColor(GL_CLAMP_FRAGMENT_COLOR_ARB, GL_FALSE);
-   } else {
+   } else
+#endif
+   {
       if (state->clamp_vertex_color || state->clamp_fragment_color)
          report_core_warn(ctx, CORE_PROFILE_WARN_CLAMP);
    }
@@ -7218,7 +7332,7 @@ static void vrend_apply_sampler_state(struct vrend_sub_context *sub_ctx,
    }
 
    if (tex->state.compare_mode != state->compare_mode || set_all)
-      glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, state->compare_mode ? GL_COMPARE_R_TO_TEXTURE : GL_NONE);
+      glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, state->compare_mode ? GL_COMPARE_REF_TO_TEXTURE : GL_NONE);
    if (tex->state.compare_func != state->compare_func || set_all)
       glTexParameteri(target, GL_TEXTURE_COMPARE_FUNC, GL_NEVER + state->compare_func);
    if (has_feature(feat_anisotropic_filter) && (tex->state.max_anisotropy != state->max_anisotropy || set_all))
@@ -7303,7 +7417,7 @@ static void vrend_free_sync_thread(void)
 static void free_fence_locked(struct vrend_fence *fence)
 {
    list_del(&fence->fences);
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (vrend_state.use_egl_fence) {
       virgl_egl_fence_destroy(egl, fence->eglsyncobj);
    } else
@@ -7337,7 +7451,7 @@ static void vrend_free_fences_for_context(struct vrend_context *ctx)
          if (fence->ctx == ctx)
             free_fence_locked(fence);
       }
-      if (vrend_state.fence_waiting) {
+      if (vrend_state.fence_waiting && vrend_state.fence_waiting->ctx == ctx) {
          /* mark the fence invalid as the sync thread is still waiting on it */
          vrend_state.fence_waiting->ctx = NULL;
       }
@@ -7352,7 +7466,7 @@ static void vrend_free_fences_for_context(struct vrend_context *ctx)
 
 static bool do_wait(struct vrend_fence *fence, bool can_block)
 {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (vrend_state.use_egl_fence)
       return virgl_egl_client_wait_fence(egl, fence->eglsyncobj, can_block);
 #endif
@@ -7391,22 +7505,14 @@ void vrend_renderer_poll(void) {
 
 static void wait_sync(struct vrend_fence *fence)
 {
-   struct vrend_context *ctx = fence->ctx;
-
    bool signal_poll = atomic_load(&vrend_state.has_waiting_queries);
    do_wait(fence, /* can_block */ true);
 
-   mtx_lock(&vrend_state.fence_mutex);
-   if (vrend_state.use_async_fence_cb) {
-      /* to be able to call free_fence_locked without locking */
-      list_inithead(&fence->fences);
-   } else {
-      list_addtail(&fence->fences, &vrend_state.fence_list);
-   }
-   vrend_state.fence_waiting = NULL;
-   mtx_unlock(&vrend_state.fence_mutex);
-
    if (!vrend_state.use_async_fence_cb) {
+      mtx_lock(&vrend_state.fence_mutex);
+      list_addtail(&fence->fences, &vrend_state.fence_list);
+      vrend_state.fence_waiting = NULL;
+      mtx_unlock(&vrend_state.fence_mutex);
       if (write_eventfd(vrend_state.eventfd, 1))
          perror("failed to write to eventfd\n");
       return;
@@ -7436,14 +7542,18 @@ static void wait_sync(struct vrend_fence *fence)
       } while (vrend_state.polling && ret);
    }
 
-   /* vrend_free_fences_for_context might have marked the fence invalid
-    * by setting fence->ctx to NULL
-    */
+   /* Keep the waiting fence discoverable until retirement. Context teardown
+    * can invalidate it while native work or query polling is still pending. */
+   mtx_lock(&vrend_state.fence_mutex);
+   struct vrend_context *ctx = fence->ctx;
    if (ctx) {
       ctx->fence_retire(fence->fence_id, ctx->fence_retire_data);
    }
 
+   vrend_state.fence_waiting = NULL;
+   list_inithead(&fence->fences);
    free_fence_locked(fence);
+   mtx_unlock(&vrend_state.fence_mutex);
 
    if (signal_poll)
       mtx_unlock(&vrend_state.poll_mutex);
@@ -7581,7 +7691,7 @@ static enum virgl_resource_fd_type vrend_pipe_resource_export_fd(UNUSED struct p
                                                                  UNUSED int *fd,
                                                                  UNUSED void *data)
 {
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    struct vrend_resource *res = (struct vrend_resource *)pres;
 
    if (res->storage_bits & VREND_STORAGE_GBM_BUFFER) {
@@ -7598,6 +7708,12 @@ static enum virgl_resource_fd_type vrend_pipe_resource_export_fd(UNUSED struct p
 bool vrend_check_no_error(struct vrend_context *ctx)
 {
    GLenum err;
+#if defined(__APPLE__) && defined(ENABLE_VIDEO)
+   if (vrend_video_failed(ctx->video)) {
+      if (!ctx->in_error) vrend_report_context_error(ctx, VIRGL_ERROR_CTX_UNKNOWN, 0);
+      return false;
+   }
+#endif
 
    err = glGetError();
    if (err == GL_NO_ERROR)
@@ -7627,6 +7743,9 @@ vrend_renderer_get_pipe_callbacks(void)
       .attach_iov = vrend_pipe_resource_attach_iov,
       .detach_iov = vrend_pipe_resource_detach_iov,
       .export_fd = vrend_pipe_resource_export_fd,
+#ifdef ENABLE_METAL
+      .get_metal_texture = vrend_renderer_resource_metal_texture,
+#endif
    };
 
    return &callbacks;
@@ -7705,7 +7824,7 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    }
 
    vrend_clicbs->make_current(gl_context);
-   gl_ver = epoxy_gl_version();
+   gl_ver = vrend_gl_version();
 
    /* Surface the full GL strings early for debugging/profile confirmation. */
    const GLubyte *gl_ver_str = glGetString(GL_VERSION);
@@ -7732,15 +7851,14 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
             glsl_ver_str ? (const char *)glsl_ver_str : "(null)");
 
    /* enable error output as early as possible */
-   if (vrend_debug(NULL, dbg_khr) && epoxy_has_gl_extension("GL_KHR_debug")) {
+   if (vrend_debug(NULL, dbg_khr) && vrend_has_gl_extension("GL_KHR_debug")) {
       glDebugMessageCallback(vrend_debug_cb, NULL);
       glEnable(GL_DEBUG_OUTPUT);
       glDisable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
       set_feature(feat_debug_cb);
    }
 
-   /* make sure you have the latest version of libepoxy */
-   gles = epoxy_is_desktop_gl() == 0;
+   gles = vrend_is_desktop_gl() == 0;
 
    vrend_state.gl_major_ver = gl_ver / 10;
    vrend_state.gl_minor_ver = gl_ver % 10;
@@ -7750,7 +7868,7 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
       vrend_state.use_gles = true;
       /* for now, makes the rest of the code use the most GLES 3.x like path */
       vrend_state.use_core_profile = true;
-   } else if (gl_ver > 30 && !epoxy_has_gl_extension("GL_ARB_compatibility")) {
+   } else if (gl_ver > 30 && !vrend_has_gl_extension("GL_ARB_compatibility")) {
       virgl_info("gl_version %d - core profile enabled\n", gl_ver);
       vrend_state.use_core_profile = true;
    } else {
@@ -7762,10 +7880,17 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    init_features(gles ? 0 : gl_ver,
                  gles ? gl_ver : 0);
 
-#ifdef __APPLE__
-   /* macOS core GL 4.1 lacks GL_ARB_copy_image; force fallback paths. */
-   clear_feature(feat_copy_image);
-#endif
+   if (has_feature(feat_timer_query)) {
+      GLint elapsed_bits = 0, timestamp_bits = 0;
+      glGetQueryiv(GL_TIME_ELAPSED, GL_QUERY_COUNTER_BITS, &elapsed_bits);
+      glGetQueryiv(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &timestamp_bits);
+      /* EXT_disjoint_timer_query permits either counter to have zero bits.
+       * VirGL advertises both query targets through a single capability, so
+       * the extension name alone is not enough to enable that capability.
+       */
+      if (elapsed_bits <= 0 || timestamp_bits <= 0)
+         clear_feature(feat_timer_query);
+   }
 
    if (!vrend_winsys_has_gl_colorspace())
       clear_feature(feat_srgb_write_control) ;
@@ -7819,6 +7944,19 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
       vrend_build_format_list_gl();
    }
 
+#ifdef ENABLE_METAL
+   if (vrend_state.use_gles && (flags & VREND_NATIVE_SHARE_TEXTURE)) {
+      /* The GL probe tests RGBA-emulated storage, but shared resources use
+       * native BGRA Metal textures. ANGLE cannot upload into BGRA sRGB
+       * EGLImages. Do not advertise a format that cannot support transfers.
+       * RGBA sRGB and BGRA UNORM remain available to guest Mesa. */
+      memset(&tex_conv_table[VIRGL_FORMAT_B8G8R8A8_SRGB], 0,
+             sizeof(tex_conv_table[0]));
+      memset(&tex_conv_table[VIRGL_FORMAT_B8G8R8X8_SRGB], 0,
+             sizeof(tex_conv_table[0]));
+   }
+#endif
+
    vrend_check_texture_storage(tex_conv_table);
 
    if (has_feature(feat_multisample)) {
@@ -7854,7 +7992,7 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    if (flags & VREND_USE_EXTERNAL_BLOB)
       vrend_state.use_external_blob = true;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    vrend_state.use_egl_fence = virgl_egl_supports_fences(egl);
 #endif
 
@@ -8182,6 +8320,17 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
       return -1;
    }
 
+#ifdef ENABLE_METAL
+   /* Keep resource creation consistent with the native Metal capability
+    * table, including imported/typed resources. Buffer formats are separate. */
+   if (vrend_state.native_share_texture && vrend_state.use_gles &&
+       args->target != PIPE_BUFFER && !tex_conv_table[args->format].internalformat) {
+      snprintf(errmsg, 256, "Unsupported native texture format %s",
+               util_format_name(args->format));
+      return -1;
+   }
+#endif
+
    bool format_can_texture_storage = has_feature(feat_texture_storage) &&
          (tex_conv_table[args->format].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE);
 
@@ -8310,7 +8459,7 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
          return -1;
       }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
       if (!virgl_gbm_gpu_import_required(args->bind)) {
          return 0;
       }
@@ -8424,7 +8573,7 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
          glBufferStorage(gr->target, width, NULL, buffer_storage_flags);
          gr->map_info = vrend_state.inferred_gl_caching_type;
       }
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
       else if (has_feature(feat_memory_object_fd) && has_feature(feat_memory_object)) {
          GLuint memobj = 0;
          int fd = -1;
@@ -8646,7 +8795,7 @@ static bool vrend_resource_d3d_acquire(ID3D11Texture2D* d3d_tex2d)
  */
 static void vrend_resource_d3d_init(UNUSED struct vrend_resource *gr, UNUSED uint32_t format)
 {
-#if defined(WIN32) && defined(HAVE_EPOXY_EGL_H)
+#if defined(WIN32) && defined(HAVE_EGL)
    D3D11_TEXTURE2D_DESC desc = {
       .Width = gr->base.width0,
       .Height = gr->base.height0,
@@ -8702,7 +8851,7 @@ fail:
  */
 static void vrend_resource_metal_init(UNUSED struct vrend_resource *gr, UNUSED uint32_t format)
 {
-#if defined(ENABLE_METAL) && defined(HAVE_EPOXY_EGL_H)
+#if defined(ENABLE_METAL) && defined(HAVE_EGL)
    MTLTexture_id tex = NULL;
 
    if (!vrend_state.native_share_texture)
@@ -8745,7 +8894,7 @@ fail:
  */
 static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
 {
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    uint32_t gbm_flags = virgl_gbm_convert_flags(gr->base.bind);
    uint32_t gbm_format = 0;
    if (virgl_gbm_convert_format(&format, &gbm_format))
@@ -8919,6 +9068,10 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
                                          GL_TRUE);
             }
          } else {
+#ifdef ENABLE_ANGLE
+            glBindTexture(gr->target, 0);
+            return EINVAL; /* Multisample GLES textures require immutable storage. */
+#else
             if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
                glTexImage2DMultisample(gr->target, pr->nr_samples,
                                        internalformat, pr->width0, pr->height0,
@@ -8928,6 +9081,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
                                        internalformat, pr->width0, pr->height0, pr->array_size,
                                        GL_TRUE);
             }
+#endif
          }
       }
       
@@ -8966,7 +9120,9 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
          }
       } else if (gr->target == GL_TEXTURE_1D && vrend_state.use_gles) {
          report_gles_missing_func(NULL, "glTexImage1D");
-      } else if (gr->target == GL_TEXTURE_1D) {
+      }
+#ifndef ENABLE_ANGLE
+      else if (gr->target == GL_TEXTURE_1D) {
          if (format_can_texture_storage) {
             glTexStorage1D(gr->target, pr->last_level + 1, internalformat, pr->width0);
          } else {
@@ -8976,7 +9132,9 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
                             glformat, gltype, NULL);
             }
          }
-      } else {
+      }
+#endif
+      else {
          if (format_can_texture_storage)
             glTexStorage2D(gr->target, pr->last_level + 1, internalformat, pr->width0,
                            gr->target == GL_TEXTURE_1D_ARRAY ? pr->array_size : pr->height0);
@@ -9002,7 +9160,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
    glBindTexture(gr->target, 0);
 
    if (image_oes && gr->gbm_bo) {
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
       if (!has_bit(gr->storage_bits, VREND_STORAGE_GL_BUFFER) &&
             !vrend_format_can_texture_view(gr->base.format)) {
          for (int i = 0; i < gbm_bo_get_plane_count(gr->gbm_bo); i++) {
@@ -9094,7 +9252,7 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       glDeleteMemoryObjectsEXT(1, &res->memobj);
    }
 
-#if (defined(ENABLE_GBM) || defined(ENABLE_METAL)) && defined(HAVE_EPOXY_EGL_H)
+#if (defined(ENABLE_GBM) || defined(ENABLE_METAL)) && defined(HAVE_EGL)
    if (res->egl_image) {
       virgl_egl_image_destroy(egl, res->egl_image);
       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {
@@ -9104,7 +9262,7 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       }
    }
 #endif
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (res->gbm_bo)
       gbm_bo_destroy(res->gbm_bo);
 #endif
@@ -9518,7 +9676,8 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
          need_temp = true;
       }
 
-      if (vrend_state.use_gles && vrend_format_is_bgra(res->base.format))
+      if (vrend_resource_upload_needs_swizzle(res) ||
+          vrend_resource_get_internal_format_override(res) != GL_NONE)
          need_temp = true;
 
       if (vrend_state.use_core_profile == true &&
@@ -9588,9 +9747,10 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
          break;
       }
 
-      glformat = tex_conv_table[res->base.format].glformat;
+      glformat = vrend_resource_upload_format(res);
       gltype = tex_conv_table[res->base.format].gltype;
 
+#ifndef ENABLE_ANGLE
       if ((!vrend_state.use_core_profile) && (res->y_0_top)) {
          GLuint buffers;
          GLuint fb_id;
@@ -9612,7 +9772,9 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
          glDrawPixels(info->box->width, info->box->height, glformat, gltype,
                       data);
          glDeleteFramebuffers(1, &fb_id);
-      } else {
+      } else
+#endif
+      {
          uint32_t comp_size;
          glBindTexture(res->target, res->gl_id);
 
@@ -9663,7 +9825,7 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                   }
                }
 
-            } else if (vrend_format_is_bgra(res->base.format)) {
+            } else if (vrend_resource_upload_needs_swizzle(res)) {
                VREND_DEBUG(dbg_bgra, ctx, "manually swizzling bgra->rgba on upload since gles+bgra\n");
                vrend_swizzle_data_bgra(send_size, data);
             }
@@ -9686,9 +9848,11 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                but we give them to the host GL and it interprets them
                as 32-bit scaled integers, so we need to scale them here */
             depth_scale = 256.0;
+#ifndef ENABLE_ANGLE
             if (!vrend_state.use_core_profile)
                glPixelTransferf(GL_DEPTH_SCALE, depth_scale);
             else
+#endif
                vrend_scale_depth(data, send_size, depth_scale);
          }
          if (res->target == GL_TEXTURE_CUBE_MAP) {
@@ -9715,7 +9879,9 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
             if (vrend_state.use_gles) {
                /* Covers both compressed and none compressed. */
                report_gles_missing_func(ctx, "gl[Compressed]TexSubImage1D");
-            } else if (compressed) {
+            }
+#ifndef ENABLE_ANGLE
+            else if (compressed) {
                glCompressedTexSubImage1D(res->target, info->level, info->box->x,
                                          info->box->width,
                                          glformat, comp_size, data);
@@ -9723,6 +9889,7 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                glTexSubImage1D(res->target, info->level, info->box->x, info->box->width,
                                glformat, gltype, data);
             }
+#endif
          } else {
             if (compressed) {
                glCompressedTexSubImage2D(res->target, info->level, x, res->target == GL_TEXTURE_1D_ARRAY ? info->box->z : y,
@@ -9735,10 +9902,12 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                                glformat, gltype, data);
             }
          }
+#ifndef ENABLE_ANGLE
          if (res->base.format == VIRGL_FORMAT_Z24X8_UNORM) {
             if (!vrend_state.use_core_profile)
                glPixelTransferf(GL_DEPTH_SCALE, 1.0);
          }
+#endif
       }
 
       if (stride && !need_temp) {
@@ -9823,17 +9992,23 @@ static int vrend_transfer_send_getteximage(struct vrend_resource *res,
       target = res->target;
 
    if (compressed) {
+#ifndef ENABLE_ANGLE
       if (has_feature(feat_arb_robustness)) {
          glGetnCompressedTexImageARB(target, info->level, tex_size, data);
-      } else if (vrend_state.use_gles) {
+      } else
+#endif
+      if (vrend_state.use_gles) {
          report_gles_missing_func(NULL, "glGetCompressedTexImage");
       } else {
          glGetCompressedTexImage(target, info->level, data);
       }
    } else {
+#ifndef ENABLE_ANGLE
       if (has_feature(feat_arb_robustness)) {
          glGetnTexImageARB(target, info->level, format, type, tex_size, data);
-      } else if (vrend_state.use_gles) {
+      } else
+#endif
+      if (vrend_state.use_gles) {
          report_gles_missing_func(NULL, "glGetTexImage");
       } else {
          glGetTexImage(target, info->level, format, type, data);
@@ -9891,14 +10066,16 @@ static void do_readpixels(struct vrend_resource *res,
       }
    }
 
+#ifndef ENABLE_ANGLE
    /* read-color clamping is handled in the mesa frontend */
    if (!vrend_state.use_gles) {
        glClampColor(GL_CLAMP_READ_COLOR_ARB, GL_FALSE);
    }
+#endif
 
    if (has_feature(feat_arb_robustness))
       glReadnPixelsARB(x, y, width, height, format, type, bufSize, data);
-   else if (epoxy_gl_version() >= 45)
+   else if (vrend_gl_version() >= 45)
       glReadnPixels(x, y, width, height, format, type, bufSize, data);
    else if (has_feature(feat_gles_khr_robustness))
       glReadnPixelsKHR(x, y, width, height, format, type, bufSize, data);
@@ -10026,29 +10203,29 @@ static int vrend_transfer_send_readpixels(struct vrend_context *ctx,
          but we give them to the host GL and it interprets them
          as 32-bit scaled integers, so we need to scale them here */
       depth_scale = 1.0 / 256.0;
+#ifndef ENABLE_ANGLE
       if (!vrend_state.use_core_profile) {
          glPixelTransferf(GL_DEPTH_SCALE, depth_scale);
       }
+#endif
    }
 
    do_readpixels(res, 0, info->level, info->box->z, info->box->x, y1,
                  info->box->width, info->box->height, format, type, send_size, data);
 
-   /* on GLES, texture-backed BGR* resources are always stored with RGB* internal format, but
-    * the guest will expect to readback the data in BGRA format.
-    * Since the GLES API doesn't allow format conversions like GL, we CPU-swizzle the data
-    * on upload and need to do the same on readback.
-    * The notable exception is externally-stored (GBM/EGL) BGR* resources, for which BGR*
-    * byte-ordering is used instead to match external access patterns. */
+   /* ReadPixels returns logical RGBA even for native BGRA storage. The guest
+    * expects BGRA bytes, so readback still needs this conversion. */
    if (vrend_state.use_gles && vrend_format_is_bgra(res->base.format)) {
       VREND_DEBUG(dbg_bgra, ctx, "manually swizzling rgba->bgra on readback since gles+bgra\n");
       vrend_swizzle_data_bgra(send_size, data);
    }
 
    if (res->base.format == VIRGL_FORMAT_Z24X8_UNORM) {
+#ifndef ENABLE_ANGLE
       if (!vrend_state.use_core_profile)
          glPixelTransferf(GL_DEPTH_SCALE, 1.0);
       else
+#endif
          vrend_scale_depth(data, send_size, depth_scale);
    }
    if (has_feature(feat_mesa_invert) && actually_invert)
@@ -10183,7 +10360,7 @@ static int vrend_renderer_transfer_internal(struct vrend_context *ctx,
       num_iovs = res->num_iovs;
    }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (res->gbm_bo && (transfer_mode == VIRGL_TRANSFER_TO_HOST ||
                        !has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE))) {
       const bool success = virgl_gbm_transfer(res->gbm_bo, transfer_mode, iov, num_iovs, info) == 0;
@@ -10276,7 +10453,7 @@ int vrend_transfer_inline_write(struct vrend_context *ctx,
       return EINVAL;
    }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (res->gbm_bo) {
       assert(!info->synchronized);
       return virgl_gbm_transfer(res->gbm_bo,
@@ -10434,7 +10611,7 @@ int vrend_renderer_copy_transfer3d(struct vrend_context *ctx,
       return EINVAL;
    }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (dst_res->gbm_bo && !TRANSFER_NO_GBM_MAPPING(info)) {
       bool use_gbm = true;
 
@@ -10499,7 +10676,7 @@ int vrend_renderer_copy_transfer3d_from_host(struct vrend_context *ctx,
       return EINVAL;
    }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (src_res->gbm_bo && !TRANSFER_NO_GBM_MAPPING(info)) {
       bool use_gbm = true;
 
@@ -10585,7 +10762,9 @@ void vrend_set_polygon_stipple(struct vrend_context *ctx,
          ctx->sub->sysvalue_data.stipple_pattern[i][0] = ps->stipple[i];
       ctx->sub->sysvalue_data_cookie++;
    } else {
+#ifndef ENABLE_ANGLE
       glPolygonStipple((const GLubyte *)ps->stipple);
+#endif
    }
 }
 
@@ -10600,6 +10779,7 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
                 (const GLfloat *) &ctx->sub->ucp_state.ucp[i], sizeof(GLfloat) * 4);
       }
    } else {
+#ifndef ENABLE_ANGLE
       int i, j;
       GLdouble val[4];
 
@@ -10608,6 +10788,7 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
             val[j] = ucp->ucp[i][j];
          glClipPlane(GL_CLIP_PLANE0 + i, val);
       }
+#endif
    }
 }
 
@@ -10632,10 +10813,13 @@ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)
 void vrend_set_tess_state(UNUSED struct vrend_context *ctx, const float tess_factors[6])
 {
    if (has_feature(feat_tessellation)) {
+#ifndef ENABLE_ANGLE
       if (!vrend_state.use_gles) {
          glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, tess_factors);
          glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, &tess_factors[4]);
-      } else {
+      } else
+#endif
+      {
          memcpy(vrend_state.tess_factors, tess_factors, 6 * sizeof (float));
       }
    }
@@ -10815,9 +10999,13 @@ static void vrend_resource_copy_fallback(struct vrend_resource *src_res,
        * On the contrary, externally-stored BGR* resources are assumed to remain in BGR* format at
        * all times.
        */
-      if (vrend_state.use_gles && vrend_format_is_bgra(dst_res->base.format))
+      if (vrend_resource_upload_needs_swizzle(dst_res))
          vrend_swizzle_data_bgra(total_size, tptr);
-   } else {
+      if (!compressed)
+         glformat = vrend_resource_upload_format(dst_res);
+   }
+#ifndef ENABLE_ANGLE
+   else {
       uint32_t read_chunk_size;
       switch (elsize) {
       case 1:
@@ -10856,6 +11044,7 @@ static void vrend_resource_copy_fallback(struct vrend_resource *src_res,
          slice_offset += slice_size;
       }
    }
+#endif
 
    glPixelStorei(GL_PACK_ALIGNMENT, 4);
    switch (elsize) {
@@ -10892,19 +11081,25 @@ static void vrend_resource_copy_fallback(struct vrend_resource *src_res,
       GLenum ctarget = dst_res->target == GL_TEXTURE_CUBE_MAP ?
                           (GLenum)(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i) : dst_res->target;
       if (compressed) {
+#ifndef ENABLE_ANGLE
          if (ctarget == GL_TEXTURE_1D) {
             glCompressedTexSubImage1D(ctarget, dst_level, dstx,
                                       src_box->width,
                                       glformat, slice_size, tptr + slice_offset);
-         } else {
+         } else
+#endif
+         {
             glCompressedTexSubImage2D(ctarget, dst_level, dstx, dsty,
                                       src_box->width, src_box->height,
                                       glformat, slice_size, tptr + slice_offset);
          }
       } else {
+#ifndef ENABLE_ANGLE
          if (ctarget == GL_TEXTURE_1D) {
             glTexSubImage1D(ctarget, dst_level, dstx, src_box->width, glformat, gltype, tptr + slice_offset);
-         } else if (ctarget == GL_TEXTURE_3D ||
+         } else
+#endif
+         if (ctarget == GL_TEXTURE_3D ||
                     ctarget == GL_TEXTURE_2D_ARRAY ||
                     ctarget == GL_TEXTURE_CUBE_MAP_ARRAY) {
             glTexSubImage3D(ctarget, dst_level, dstx, dsty, dstz, src_box->width, src_box->height, src_box->depth, glformat, gltype, tptr + slice_offset);
@@ -10919,6 +11114,24 @@ cleanup:
    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
    free(tptr);
    glBindTexture(dst_res->target, 0);
+}
+
+static bool vrend_resources_can_copy_image(const struct vrend_resource *src,
+                                           const struct vrend_resource *dst)
+{
+   if (!has_feature(feat_copy_image))
+      return false;
+
+   /* CopyImage copies storage, not logical GL colors. Native BGRA and
+    * RGBA-emulated BGRA must go through a format-aware FBO/shader blit. */
+   if (vrend_resource_is_native_bgra(src) != vrend_resource_is_native_bgra(dst))
+      return false;
+#ifdef __APPLE__
+   /* Keep the known ANGLE multisample restriction local to that backend. */
+   if (vrend_state.use_gles && (src->base.nr_samples > 1 || dst->base.nr_samples > 1))
+      return false;
+#endif
+   return true;
 }
 
 static inline void
@@ -11047,30 +11260,11 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
    if (dst_res->egl_image)
       comp_flags ^= VREND_COPY_COMPAT_FLAG_ONE_IS_EGL_IMAGE;
 
-   bool allow_copy_image = has_feature(feat_copy_image) &&
+   bool allow_copy_image = vrend_resources_can_copy_image(src_res, dst_res) &&
                            format_is_copy_compatible(src_res->base.format,
                                                      dst_res->base.format,
                                                      comp_flags) &&
                            src_res->base.nr_samples == dst_res->base.nr_samples;
-
-   /* ANGLE/Metal on macOS returns GL_INVALID_ENUM for multisample copy_image
-    * targets when running in GLES mode. Prefer the blit fallback instead.
-    */
-   if (allow_copy_image &&
-       (src_res->target == GL_TEXTURE_2D_MULTISAMPLE ||
-        src_res->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY ||
-        dst_res->target == GL_TEXTURE_2D_MULTISAMPLE ||
-        dst_res->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)) {
-      allow_copy_image = false;
-   }
-#ifdef __APPLE__
-   /* ANGLE GLES on macOS can still advertise copy_image but fail at runtime;
-    * force shader blit when running GLES on Apple to avoid GL_INVALID_ENUM.
-    */
-   if (allow_copy_image && vrend_state.use_gles) {
-      allow_copy_image = false;
-   }
-#endif
 
    if (allow_copy_image) {
       VREND_DEBUG(dbg_copy_resource, ctx, "COPY_REGION: use glCopyImageSubData\n");
@@ -11144,6 +11338,7 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
 }
 
 
+#ifndef ENABLE_ANGLE
 static inline bool texture_view_compatible(enum virgl_formats src, enum virgl_formats dst)
 {
    return (tex_conv_table[src].view_class != view_class_unsupported) &&
@@ -11184,6 +11379,7 @@ static GLuint vrend_make_view(struct vrend_resource *res, enum virgl_formats for
                  0, res->base.array_size);
    return view_id;
 }
+#endif
 
 static bool vrend_blit_needs_redblue_swizzle(struct vrend_resource *src_res,
                                              struct vrend_resource *dst_res,
@@ -11277,8 +11473,8 @@ static bool vrend_renderer_prepare_blit(struct vrend_context *ctx,
        !vrend_format_is_ds(src_res->base.format))
       return false;
 
-   if (!vrend_format_can_render(src_res->base.format) &&
-       !vrend_format_is_ds(src_res->base.format))
+   if (!vrend_format_can_render(dst_res->base.format) &&
+       !vrend_format_is_ds(dst_res->base.format))
       return false;
 
    /* different depth formats */
@@ -11518,6 +11714,7 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
 
    /* We create the texture views in this function instead of doing it in
     * vrend_renderer_prepare_blit_extra_info because we also delete them here */
+#ifndef ENABLE_ANGLE
    if ((src_res->base.format != info->src.format) && has_feature(feat_texture_view) &&
        vrend_resource_supports_view(src_res, info->src.format))
       blit_info.src_view = vrend_make_view(src_res, info->src.format);
@@ -11525,6 +11722,7 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
    if ((dst_res->base.format != info->dst.format) && has_feature(feat_texture_view) &&
        vrend_resource_supports_view(dst_res, info->dst.format))
       blit_info.dst_view = vrend_make_view(dst_res, info->dst.format);
+#endif
 
    vrend_renderer_prepare_blit_extra_info(ctx, src_res, dst_res, &blit_info);
 
@@ -11532,8 +11730,8 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use FBO blit\n");
       vrend_renderer_blit_fbo(ctx, src_res, dst_res, &blit_info);
    } else {
-      blit_info.has_srgb_write_control = has_feature(feat_texture_srgb_decode);
-      blit_info.has_texture_srgb_decode = has_feature(feat_srgb_write_control);
+      blit_info.has_srgb_write_control = has_feature(feat_srgb_write_control);
+      blit_info.has_texture_srgb_decode = has_feature(feat_texture_srgb_decode);
 
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use GL fallback\n");
       vrend_renderer_blit_gl(ctx, src_res, dst_res, &blit_info);
@@ -11603,8 +11801,10 @@ void vrend_renderer_blit(struct vrend_context *ctx,
       return;
    }
 
+#ifndef ENABLE_ANGLE
    if (info->render_condition_enable == false)
       vrend_pause_render_condition(ctx, true);
+#endif
 
    VREND_DEBUG(dbg_blit, ctx, "BLIT: rc:%d scissor:%d filter:%d alpha:%d mask:0x%x\n"
                                    "  From %s(%s) ms:%d egl:%d gbm:%d [%d, %d, %d]+[%d, %d, %d] lvl:%d\n"
@@ -11652,7 +11852,7 @@ void vrend_renderer_blit(struct vrend_context *ctx,
     * to resource_copy_region, in this case and if no render states etx need
     * to be applied, forward the call to glCopyImageSubData, otherwise do a
     * normal blit. */
-   bool allow_copy_image = has_feature(feat_copy_image) &&
+   bool allow_copy_image = vrend_resources_can_copy_image(src_res, dst_res) &&
        (!info->render_condition_enable || !ctx->sub->cond_render_gl_mode) &&
        format_is_copy_compatible(info->src.format,info->dst.format, comp_flags) &&
        eglimage_copy_compatible &&
@@ -11667,23 +11867,6 @@ void vrend_renderer_blit(struct vrend_context *ctx,
        info->src.box.height == info->dst.box.height &&
        info->src.box.depth == info->dst.box.depth;
 
-   /* ANGLE/Metal GLES path returns GL_INVALID_ENUM for copy_image on MSAA
-    * targets; avoid copy_image there. Also prefer shader blit when running
-    * GLES on macOS even for non-MSAA to steer clear of driver quirks.
-    */
-   if (allow_copy_image &&
-       (src_res->target == GL_TEXTURE_2D_MULTISAMPLE ||
-        src_res->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY ||
-        dst_res->target == GL_TEXTURE_2D_MULTISAMPLE ||
-        dst_res->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)) {
-      allow_copy_image = false;
-   }
-#ifdef __APPLE__
-   if (allow_copy_image && vrend_state.use_gles) {
-      allow_copy_image = false;
-   }
-#endif
-
    if (allow_copy_image) {
       VREND_DEBUG(dbg_blit, ctx,  "  Use glCopyImageSubData\n");
       vrend_copy_sub_image(src_res, dst_res, info->src.level, &info->src.box,
@@ -11694,8 +11877,10 @@ void vrend_renderer_blit(struct vrend_context *ctx,
       vrend_renderer_blit_int(ctx, src_res, dst_res, info);
    }
 
+#ifndef ENABLE_ANGLE
    if (info->render_condition_enable == false)
       vrend_pause_render_condition(ctx, false);
+#endif
 }
 
 void vrend_renderer_set_fence_retire(struct vrend_context *ctx,
@@ -11721,7 +11906,7 @@ int vrend_renderer_create_fence(struct vrend_context *ctx,
    fence->flags = flags;
    fence->fence_id = fence_id;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (vrend_state.use_egl_fence) {
       fence->eglsyncobj = virgl_egl_fence_create(egl);
    } else
@@ -11743,7 +11928,7 @@ int vrend_renderer_create_fence(struct vrend_context *ctx,
       list_addtail(&fence->fences, &vrend_state.fence_list);
    }
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    int fence_fd = -1;
    if (vrend_renderer_export_ctx0_fence(fence_id, &fence_fd) == 0 &&
        virgl_fence_set_fd(fence_id, fence_fd))
@@ -11809,9 +11994,8 @@ void vrend_renderer_check_fences(void)
       }
       mtx_unlock(&vrend_state.fence_mutex);
    } else {
-      vrend_renderer_force_ctx_0();
-
       list_for_each_entry_safe(struct vrend_fence, fence, &vrend_state.fence_list, fences) {
+         vrend_renderer_force_ctx_0();
          if (do_wait(fence, /* can_block */ false)) {
             list_del(&fence->fences);
             list_addtail(&fence->fences, &retired_fences);
@@ -12182,9 +12366,11 @@ int vrend_begin_query(struct vrend_context *ctx, uint32_t handle)
    if (q->gltype == GL_TIMESTAMP || q->invalid)
       return 0;
 
+#ifndef ENABLE_ANGLE
    if (q->index > 0)
       glBeginQueryIndexed(q->gltype, q->index, q->id);
    else
+#endif
       glBeginQuery(q->gltype, q->id);
    return 0;
 }
@@ -12214,9 +12400,11 @@ int vrend_end_query(struct vrend_context *ctx, uint32_t handle)
       return 0;
    }
 
+#ifndef ENABLE_ANGLE
    if (q->index > 0)
       glEndQueryIndexed(q->gltype, q->index);
    else
+#endif
       glEndQuery(q->gltype);
    return 0;
 }
@@ -12348,6 +12536,7 @@ int vrend_get_query_result_qbo(struct vrend_context *ctx, uint32_t handle,
   return 0;
 }
 
+#ifndef ENABLE_ANGLE
 static void vrend_pause_render_condition(struct vrend_context *ctx, bool pause)
 {
    if (pause) {
@@ -12368,12 +12557,19 @@ static void vrend_pause_render_condition(struct vrend_context *ctx, bool pause)
       }
    }
 }
+#endif
 
 void vrend_render_condition(struct vrend_context *ctx,
                             uint32_t handle,
                             bool condition,
                             uint32_t mode)
 {
+#ifdef ENABLE_ANGLE
+   (void)condition;
+   (void)mode;
+   if (handle)
+      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_UNSUPPORTED_FUNCTION, handle);
+#else
    struct vrend_query *q;
    GLenum glmode = 0;
 
@@ -12418,6 +12614,7 @@ void vrend_render_condition(struct vrend_context *ctx,
       glBeginConditionalRender(q->id, glmode);
    else if (has_feature(feat_nv_conditional_render))
       glBeginConditionalRenderNV(q->id, glmode);
+#endif
 }
 
 int vrend_create_so_target(struct vrend_context *ctx,
@@ -12596,7 +12793,7 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
    if (caps->v1.glsl_level >= 400 || has_feature(feat_tessellation))
       caps->v1.prim_mask |= (1 << PIPE_PRIM_PATCHES);
 
-   if (epoxy_has_gl_extension("GL_ARB_vertex_type_10f_11f_11f_rev"))
+   if (vrend_has_gl_extension("GL_ARB_vertex_type_10f_11f_11f_rev"))
       set_format_bit(&caps->v1.vertexbuffer, VIRGL_FORMAT_R11G11B10_FLOAT);
 
    if (has_feature(feat_nv_conditional_render) ||
@@ -12630,8 +12827,8 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
                      max, caps->v1.max_uniform_blocks);
       }
    } else {
-      virgl_debug("[VREND CAPS] feat_ubo=NO (gl_ver=%d, gles_ver=%d, epoxy_gl_version=%d, epoxy_is_desktop_gl=%d)\n",
-                  gl_ver, gles_ver, epoxy_gl_version(), epoxy_is_desktop_gl());
+      virgl_debug("[VREND CAPS] feat_ubo=NO (gl_ver=%d, gles_ver=%d, vrend_gl_version=%d, vrend_is_desktop_gl=%d)\n",
+                  gl_ver, gles_ver, vrend_gl_version(), vrend_is_desktop_gl());
    }
 
    if (has_feature(feat_depth_clamp))
@@ -12641,9 +12838,9 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
       caps->v1.bset.fragment_coord_conventions = 1;
       caps->v1.bset.seamless_cube_map = 1;
    } else {
-      if (epoxy_has_gl_extension("GL_ARB_fragment_coord_conventions"))
+      if (vrend_has_gl_extension("GL_ARB_fragment_coord_conventions"))
          caps->v1.bset.fragment_coord_conventions = 1;
-      if (epoxy_has_gl_extension("GL_ARB_seamless_cube_map") || gles_ver >= 30)
+      if (vrend_has_gl_extension("GL_ARB_seamless_cube_map") || gles_ver >= 30)
          caps->v1.bset.seamless_cube_map = 1;
    }
 
@@ -12680,15 +12877,15 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
       caps->v1.bset.has_fp64 = 1;
    } else {
       /* need gpu shader 5 for bitfield insert */
-      if (epoxy_has_gl_extension("GL_ARB_gpu_shader_fp64") &&
-          epoxy_has_gl_extension("GL_ARB_gpu_shader5"))
+      if (vrend_has_gl_extension("GL_ARB_gpu_shader_fp64") &&
+          vrend_has_gl_extension("GL_ARB_gpu_shader5"))
          caps->v1.bset.has_fp64 = 1;
    }
 
    if (has_feature(feat_base_instance))
       caps->v1.bset.start_instance = 1;
 
-   if (epoxy_has_gl_extension("GL_ARB_shader_stencil_export")) {
+   if (vrend_has_gl_extension("GL_ARB_shader_stencil_export")) {
       caps->v1.bset.shader_stencil_export = 1;
    }
 
@@ -12701,7 +12898,7 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
    } else {
      if (has_feature(feat_cull_distance))
         caps->v1.bset.has_cull = 1;
-     if (epoxy_has_gl_extension("GL_ARB_derivative_control"))
+     if (vrend_has_gl_extension("GL_ARB_derivative_control"))
         caps->v1.bset.derivative_control = 1;
    }
 
@@ -13265,7 +13462,7 @@ angle_done:
    if (has_feature(feat_clip_control))
       caps->v2.capability_bits |= VIRGL_CAP_CLIP_HALFZ;
 
-   if (epoxy_has_gl_extension("GL_KHR_texture_compression_astc_sliced_3d"))
+   if (vrend_has_gl_extension("GL_KHR_texture_compression_astc_sliced_3d"))
       caps->v2.capability_bits |= VIRGL_CAP_3D_ASTC;
 
    caps->v2.capability_bits |= VIRGL_CAP_INDIRECT_INPUT_ADDR;
@@ -13303,7 +13500,7 @@ angle_done:
          caps->v2.capability_bits |= VIRGL_CAP_ARB_BUFFER_STORAGE;
    }
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (gbm) {
       if (has_feature(feat_memory_object) && has_feature(feat_memory_object_fd)) {
          if ((!strcmp(gbm_device_get_backend_name(gbm->device), "i915") ||
@@ -13318,7 +13515,7 @@ angle_done:
    if (has_feature(feat_blend_equation_advanced))
       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_BLEND_EQUATION;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    if (egl)
       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_UNTYPED_RESOURCE;
 #endif
@@ -13467,11 +13664,11 @@ void vrend_renderer_fill_caps(uint32_t set, uint32_t version,
       virgl_warn("%s: Entering with stale GL error: %d\n", __func__, err);
 
    if (vrend_state.use_gles) {
-      gles_ver = epoxy_gl_version();
+      gles_ver = vrend_gl_version();
       gl_ver = 0;
    } else {
       gles_ver = 0;
-      gl_ver = epoxy_gl_version();
+      gl_ver = vrend_gl_version();
    }
 
    vrend_fill_caps_glsl_version(gl_ver, gles_ver, caps);
@@ -13492,7 +13689,10 @@ void vrend_renderer_fill_caps(uint32_t set, uint32_t version,
 
 GLint64 vrend_renderer_get_timestamp(void)
 {
-   GLint64 v;
+   if (!has_feature(feat_timer_query))
+      return 0;
+
+   GLint64 v = 0;
    glGetInteger64v(GL_TIMESTAMP, &v);
    return v;
 }
@@ -13533,10 +13733,13 @@ void *vrend_renderer_get_cursor_contents(struct pipe_resource *pres,
       return NULL;
    }
 
+#ifndef ENABLE_ANGLE
    if (has_feature(feat_arb_robustness)) {
       glBindTexture(res->target, res->gl_id);
       glGetnTexImageARB(res->target, 0, format, type, size, data);
-   } else if (vrend_state.use_gles) {
+   } else
+#endif
+   if (vrend_state.use_gles) {
       do_readpixels(res, 0, 0, 0, 0, 0, *width, *height, format, type, size, data);
    } else {
       glBindTexture(res->target, res->gl_id);
@@ -13876,7 +14079,7 @@ int vrend_renderer_export_query(struct pipe_resource *pres,
 {
    struct vrend_resource *res = (struct vrend_resource *)pres;
 
-#if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+#if defined(HAVE_EGL) && defined(ENABLE_GBM_ALLOCATION)
    if (res->gbm_bo)
       return virgl_gbm_export_query(res->gbm_bo, export_query);
 #else
@@ -13978,7 +14181,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
       if (!gr)
          return ENOMEM;
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
       if (egl) {
 #ifdef ENABLE_GBM
          if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
@@ -14080,9 +14283,9 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
 
 #endif /* ENABLE_GBM */
       } else {
-#else /* HAVE_EPOXY_EGL_H */
+#else /* HAVE_EGL */
       {
-#endif /* HAVE_EPOXY_EGL_H */
+#endif /* HAVE_EGL */
          int fd = -1;
          GLenum internalformat = tex_conv_table[gr->base.format].internalformat;
 
@@ -14171,7 +14374,7 @@ int vrend_renderer_create_ctx0_fence(uint32_t fence_id)
          VIRGL_RENDERER_FENCE_FLAG_MERGEABLE, fence_id);
 }
 
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
 static bool find_ctx0_fence_locked(struct list_head *fence_list,
                                    uint64_t fence_id,
                                    bool *seen_first,
@@ -14199,7 +14402,7 @@ static bool find_ctx0_fence_locked(struct list_head *fence_list,
 #endif
 
 int vrend_renderer_export_ctx0_fence(uint32_t fence_id, int* out_fd) {
-#ifdef HAVE_EPOXY_EGL_H
+#ifdef HAVE_EGL
    int ret = 0;
 
    if (!vrend_state.use_egl_fence) {

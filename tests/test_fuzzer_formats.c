@@ -39,7 +39,7 @@
 #include "vrend/vrend_winsys_egl.h"
 #include "virglrenderer.h"
 #include "virgl_protocol.h"
-#include <epoxy/egl.h>
+#include "vrend/vrend_gl.h"
 
 
 struct fuzzer_cookie

@@ -211,13 +211,14 @@ def write_format_aliases(formats):
             print("#define %s %s" % (f.be_alias, f.name), file=sys.stdout3)
     print("#endif", file=sys.stdout3)
 
-CHROMA_SUBSAMP = ['400', '420', '422', '444', '440']
+# Mesa's video commands use these enum values, not the format table's order.
+CHROMA_SUBSAMP = ['400', '420', '422', '440', '444']
 
 def write_to_chroma_format(formats):
     print('enum pipe_video_chroma_format {', file=sys.stdout3)
-    for subsamp in CHROMA_SUBSAMP:
-        print('   PIPE_VIDEO_CHROMA_FORMAT_%s,' % subsamp, file=sys.stdout3)
-    print('   PIPE_VIDEO_CHROMA_FORMAT_NONE,', file=sys.stdout3)
+    print('   PIPE_VIDEO_CHROMA_FORMAT_NONE = 0,', file=sys.stdout3)
+    for value, subsamp in enumerate(CHROMA_SUBSAMP, 1):
+        print('   PIPE_VIDEO_CHROMA_FORMAT_%s = %d,' % (subsamp, value), file=sys.stdout3)
     print('};', file=sys.stdout3)
     print(file=sys.stdout3)
     print('static inline enum pipe_video_chroma_format', file=sys.stdout3)

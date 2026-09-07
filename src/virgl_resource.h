@@ -122,7 +122,9 @@ struct virgl_resource {
 	/* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
 	void *metal_heap;
 	/* When fd_type == VIRGL_RESOURCE_METAL_BUFFER */
-	void *metal_buffer;
+   void *metal_buffer;
+   /* Fixed native backing owned independently of renderer/importer views. */
+   void *native_metal_texture;
 	/* Exact VkImage identity published by Venus. The heap remains only the
 	 * allocation transport; scanout never reconstructs a texture from it. */
 	struct virgl_resource_metal_texture_state *metal_texture_state;
@@ -156,6 +158,7 @@ struct virgl_resource_pipe_callbacks {
    enum virgl_resource_fd_type (*export_fd)(struct pipe_resource *pres,
                                             int *fd,
                                             void *data);
+   void *(*get_metal_texture)(struct pipe_resource *pres);
 };
 
 int
