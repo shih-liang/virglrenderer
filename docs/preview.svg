@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="720" viewBox="0 0 1160 720" role="img" aria-labelledby="title desc">
+<title id="title">Virglrenderer embedding and graphics pipeline preview</title>
+<desc id="desc">Illustrative preview using fictional sample data. This is a functional illustration, not a captured application screenshot.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#EFF7F3"/><stop offset="1" stop-color="#F4ECF0"/></linearGradient><linearGradient id="glass" x2="0" y2="1"><stop stop-color="#FFF"/><stop offset="1" stop-color="#F5F8F7"/></linearGradient></defs>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;font-variant-ligatures:none} .mono{font-family:Menlo,Consolas,monospace}</style>
+<rect x="0" y="0" width="1160" height="720" rx="24" fill="url(#bg)"/>
+<text xml:space="preserve" x="50" y="48" font-size="27" fill="#23302F" font-weight="600">Guest graphics rendered by the host</text>
+<rect x="50" y="99" width="1060" height="548" rx="16" fill="#D9E3DF"/>
+<rect x="50" y="94" width="1060" height="548" rx="16" fill="#FFF" stroke="#C9D6D1"/>
+<rect x="51" y="95" width="1058" height="47" rx="15" fill="url(#glass)"/>
+<rect x="51" y="118" width="1058" height="24" rx="0" fill="#F6F9F7"/>
+<path d="M50 142 L1110 142" stroke="#D8E3DF" stroke-width="1" fill="none"/>
+<circle cx="73" cy="118" r="6" fill="#F26865"/>
+<circle cx="95" cy="118" r="6" fill="#EEBA4B"/>
+<circle cx="117" cy="118" r="6" fill="#5CBB7A"/>
+<text xml:space="preserve" x="580.0" y="124" font-size="17" fill="#23302F" font-weight="600" text-anchor="middle">Renderer integration — development example</text>
+<text xml:space="preserve" x="80" y="189" font-size="23" fill="#23302F" font-weight="600">Embedding API</text>
+<text xml:space="preserve" x="80" y="239" font-size="19" fill="#187A70" font-weight="400" class="mono">virgl_renderer_init(cookie, flags, callbacks);</text>
+<text xml:space="preserve" x="80" y="281" font-size="19" fill="#187A70" font-weight="400" class="mono">virgl_renderer_submit_cmd(buffer, ctx_id, size);</text>
+<text xml:space="preserve" x="80" y="323" font-size="19" fill="#187A70" font-weight="400" class="mono">virgl_renderer_poll();</text>
+<path d="M79 347 L1081 347" stroke="#D8E3DF" stroke-width="1" fill="none"/>
+<rect x="79" y="409" width="301" height="112" rx="12" fill="#EEF6F2" stroke="#D8E3DF"/>
+<text xml:space="preserve" x="100" y="450" font-size="22" fill="#187A70" font-weight="600">Guest graphics</text>
+<text xml:space="preserve" x="100" y="485" font-size="16" fill="#60716E" font-weight="400">OpenGL commands</text>
+<rect x="429" y="409" width="301" height="112" rx="12" fill="#EEF6F2" stroke="#D8E3DF"/>
+<text xml:space="preserve" x="450" y="450" font-size="22" fill="#187A70" font-weight="600">virglrenderer</text>
+<text xml:space="preserve" x="450" y="485" font-size="16" fill="#60716E" font-weight="400">Command / resource handling</text>
+<rect x="779" y="409" width="301" height="112" rx="12" fill="#EEF6F2" stroke="#D8E3DF"/>
+<text xml:space="preserve" x="800" y="450" font-size="22" fill="#187A70" font-weight="600">Host renderer</text>
+<text xml:space="preserve" x="800" y="485" font-size="16" fill="#60716E" font-weight="400">Application integration</text>
+<path d="M383 465 L423 465" stroke="#187A70" stroke-width="3" fill="none"/>
+<path d="M414 459 L423 465 L414 471" fill="none" stroke="#187A70" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M733 465 L773 465" stroke="#187A70" stroke-width="3" fill="none"/>
+<path d="M764 459 L773 465 L764 471" fill="none" stroke="#187A70" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<text xml:space="preserve" x="80" y="584" font-size="18" fill="#60716E" font-weight="400">virtio-gpu carries guest commands. The embedding application supplies the host context.</text>
+<text xml:space="preserve" x="580.0" y="696" font-size="15" fill="#60716E" font-weight="400" text-anchor="middle">Illustrative embedding preview · Library, not a standalone diagnostics app</text>
+</svg>

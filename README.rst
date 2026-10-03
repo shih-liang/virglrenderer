@@ -1,6 +1,20 @@
 `Virglrenderer <https://virgil3d.github.io/>`_ - The VirGL virtual OpenGL renderer
 ==================================================================================
 
+.. image:: docs/logo.svg
+   :width: 160px
+   :alt: Virglrenderer fork: a rendered cube
+
+Integration preview
+-------------------
+
+.. image:: docs/preview.png
+   :width: 1000px
+   :alt: Virglrenderer embedding API and the guest graphics to host renderer pipeline
+
+*Illustrative preview, sample data.* A development example for this fork of
+the rendering library, not a standalone diagnostics application or benchmark.
+
 
 Source
 ------
